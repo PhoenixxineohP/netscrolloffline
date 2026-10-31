@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="settings-page">
+  <h1>Settings</h1>
+
+  <form method="post" action="{{ url_for('api_settings_save') }}" class="settings-form">
+    <h2>WEBTOON web session cookie</h2>
+    <p class="muted">
+      Paste the cookie from a browser where you're logged in at webtoons.com
+      (F12 → Application/Storage → Cookies → the whole <code>Cookie</code> header or at least
+      <code>NIDP_crd_...=...; NICKNAME=...; GDPR=...; needGDPRsetVisible=false</code> style pairs).
+      This lets the app read <em>exactly what your account can read right now</em> — no more, no less.
+    </p>
+    <textarea name="webtoon_cookie" rows="4" placeholder="NIDP_crd_123=abc…">{{ cookie }}</textarea>
+
+    <h2>Politeness delays (seconds)</h2>
+    <label>Between page/viewer requests <input type="number" name="check_delay" step="0.1" min="0" value="{{ check_delay }}"></label>
+    <label>Between image downloads <input type="number" name="img_delay" step="0.05" min="0" value="{{ img_delay }}"></label>
+
+    <button class="primary" type="submit">Save settings</button>
+  </form>
+</section>
+{% endblock %}

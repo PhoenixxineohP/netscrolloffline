@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ ep['title'] or ('Ep ' ~ ep_no) }} — {{ s['title'] }} — NetScrollOffline{% endblock %}
+{% block content %}
+<div class="reader-top">
+  <a href="{{ url_for('series_page', series_id=s['id']) }}">← {{ s['title'] }}</a>
+  <span class="ep-title">{{ ep['title'] or ('Ep ' ~ ep_no) }}</span>
+  <span class="spacer"></span>
+  {% if prev_ep %}<a class="rnav" href="{{ url_for('reader', series_id=s['id'], ep_no=prev_ep) }}">‹ Prev</a>{% endif %}
+  {% if next_ep %}<a class="rnav" href="{{ url_for('reader', series_id=s['id'], ep_no=next_ep) }}">Next ›</a>{% endif %}
+</div>
+
+<div id="reader" class="reader" data-series="{{ s['id'] }}" data-ep="{{ ep_no }}">
+  <div id="strip" class="strip"><p class="muted loading">Loading pages…</p></div>
+  <div id="reader-error" hidden></div>
+</div>
+
+<div class="reader-bottom">
+  {% if prev_ep %}<a class="rnav" href="{{ url_for('reader', series_id=s['id'], ep_no=prev_ep) }}">‹ Prev</a>{% endif %}
+  <span class="muted" id="posinfo"></span>
+  {% if next_ep %}<a class="rnav" href="{{ url_for('reader', series_id=s['id'], ep_no=next_ep) }}">Next ›</a>{% endif %}
+</div>
+
+<script>
+const READER_DATA = {
+  seriesId: {{ s['id'] }},
+  epNo: {{ ep_no }},
+  startPx: {{ start_px | default(0) }},
+  startFrac: {{ start_frac | default(0) }},
+  images: [],
+  remote: false
+};
+</script>
+<script src="{{ url_for('static', filename='reader.js') }}"></script>
+{% endblock %}

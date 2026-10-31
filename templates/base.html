@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}NetScrollOffline{% endblock %}</title>
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <meta name="theme-color" content="#0f1115">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('library') }}">Net<span>Scroll</span>Offline</a>
+    <nav>
+      <a href="{{ url_for('library') }}">Library</a>
+      <a href="{{ url_for('settings_page') }}">Settings</a>
+    </nav>
+    <form class="profilebox" method="post" action="{{ url_for('api_profile_switch') }}">
+      <label>Profile</label>
+      <select name="profile_id" onchange="this.form.submit()">
+        {% for p in profiles %}
+          <option value="{{ p.id }}" {% if profile and p.id == profile['id'] %}selected{% endif %}>{{ p['name'] }}</option>
+        {% endfor %}
+      </select>
+      <button id="installBtn" type="button" hidden onclick="window.__install && window.__install()" title="Install as an app on this device">⤓ Install app</button>
+    </form>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <script src="/static/nslib.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+  <script>
+    if ('serviceWorker' in navigator) {
+      addEventListener('load', function () {
+        navigator.serviceWorker.register('/static/sw.js', { scope: '/' }).catch(function () {});
+      });
+    }
+    let __nsPrompt = null;
+    addEventListener('beforeinstallprompt', function (e) {
+      e.preventDefault(); __nsPrompt = e;
+      var b = document.getElementById('installBtn'); if (b) b.hidden = false;
+    });
+    window.__install = function () {
+      if (__nsPrompt) { __nsPrompt.prompt(); __nsPrompt = null; }
+    };
+  </script>
+</body>
+</html>

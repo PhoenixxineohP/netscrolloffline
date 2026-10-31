@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}{{ s['title'] }} — NetScrollOffline{% endblock %}
+{% block content %}
+<section class="banner" {% if s['cover'] and s['cover_kind']=='banner' %}style="background-image:url('{{ s['cover'] }}')"{% endif %}>
+  <div class="shade">
+    <p class="crumb"><a href="{{ url_for('library') }}">← Library</a></p>
+    <h1>{{ s['title'] }}</h1>
+    <p class="muted">{{ s['authors'] }}
+      {% if s['series_status'] %}· {{ s['series_status'] }}{% endif %}
+      · last checked {{ s['last_checked'] or 'never' }}</p>
+    <p class="desc">{{ s['description'][:300] }}</p>
+  </div>
+</section>
+
+<section class="actions">
+    <button id="btn-refresh">↻ Refresh episode list</button>
+    <button id="btn-savefree" class="primary">⬇ Save to Phoenix Records (PC)</button>
+    <button id="btn-check">Check availability (range)</button>
+    <button id="btn-device-range" title="Copy episodes into THIS device's storage for offline reading">📱 Save range to this device</button>
+    <span class="muted" id="device-note"></span>
+    <details class="row">
+      <summary>Quick metadata edit</summary>
+      <form id="meta-form" class="inline" method="post"
+            action="/api/series/{{ s['id'] }}/meta">
+        <label>Kind
+          <select name="kind">
+            <option value="webtoon" {% if s['kind']=='webtoon' %}selected{% endif %}>webtoon (scroll)</option>
+            <option value="manga" {% if s['kind']=='manga' %}selected{% endif %}>manga (page-by-page)</option>
+          </select>
+        </label>
+        <label>Genre tags (comma-separated, up to 200 chars)
+          <input type="text" name="genre_tags" value="{{ s['genre_tags'] or '' }}"
+                 placeholder="e.g. Super Hero, Action" maxlength="200"></label>
+        <label>Series status
+          <select name="series_status">
+            <option value="">-- select --</option>
+            <option value="COMPLETED" {% if s['series_status']=='COMPLETED' %}selected{% endif %}>Completed</option>
+            <option value="ONGOING" {% if s['series_status']=='ONGOING' %}selected{% endif %}>Ongoing</option>
+            <option value="HIATUS" {% if s['series_status']=='HIATUS' %}selected{% endif %}>Hiatus</option>
+          </select>
+        </label>
+        <button type="submit" class="secondary">Save</button>
+        <button type="button" class="danger"
+                onclick="window.location='{{ url_for('api_series_delete', series_id=s['id']) }}'">
+          Delete series
+        </button>
+      </form>
+    </details>
+    <details class="row danger-zone">
+      <summary>Delete series…</summary>
+      <form method="post" action="{{ url_for('api_series_delete', series_id=s['id']) }}">
+        <button class="danger">Delete {{ s['title'] }} and its downloaded files</button>
+      </form>
+    </details>
+  </section>
+
+  <section class="jobbox" id="jobbox" hidden>
+    <div class="jobline"><span id="job-desc"></span><span id="job-count"></span></div>
+    <div class="bar"><div id="job-bar"></div></div>
+    <div class="jobmsg" id="job-msg"></div>
+  </section>
+
+{% if s['max_episode_no'] and s['max_episode_no'] > known %}
+<p class="notice warn">
+  The site's web episode list only exposes {{ known }} episode(s) here, while the app shows
+  {{ s['max_episode_no'] }}. That means the rest are app-only / Daily Pass / Fast Pass for your
+  account. They stay <em>unknown</em> until a "Check" or a download attempt sees them readable on
+  the web (for example after watching/unlocking in the app, if the web viewer honors it).
+  Tip: run <b>Refresh</b> again while your webtoons.com session cookie is set in Settings.
+</p>
+{% endif %}
+
+<section class="eplist">
+  <div id="ep-rows">
+    {% for ep in eps %}
+    <div class="eprow" data-no="{{ ep['episode_no'] }}">
+      <span class="no">#{{ ep['episode_no'] }}</span>
+      <span class="ti">
+        {% if ep['title'] %}{{ ep['title'] }}{% else %}<span class="muted">not on web list</span>{% endif %}
+        {% if prog.get(ep['episode_no']) %}<span class="readbar" style="width: {{ (prog[ep['episode_no']]['scroll_frac'] * 100) | round(0) | int }}%"></span>{% endif %}
+      </span>
+      <span class="pill {{ ep['status'] }}">{{ 'Phoenix ✓' if ep['status'] == 'downloaded' else ep['status'] }}</span>
+      <span class="btns">
+        <button class="mini act-read" {% if ep['status'] not in ('downloaded', 'unknown', 'available') %}disabled{% endif %}>Read</button>
+        <button class="mini act-dl" title="Archive permanently on the PC (Phoenix Records)">💾 Save</button>
+        <button class="mini act-device" title="Copy to THIS device for offline reading">📱 Device</button>
+      </span>
+    </div>
+    {% else %}
+    <p class="empty">No episodes yet — hit <b>Refresh episode list</b>.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<script>
+const SID = {{ s['id'] }};
+const MAXNO = {{ s['max_episode_no'] or 0 }};
+</script>
+<script src="{{ url_for('static', filename='series.js') }}"></script>
+{% endblock %}

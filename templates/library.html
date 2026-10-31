@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <h1>Your library</h1>
+    <p class="muted">Episodes saved to <b>Phoenix Records</b> (the PC archive) are permanent — devices just borrow copies.</p>
+  </div>
+  <form method="post" action="{{ url_for('api_series_add') }}" class="addrow">
+    <input type="text" name="url" placeholder="Paste a series URL, e.g. https://www.webtoons.com/en/…/list?title_no=5034" required>
+    <button type="submit">Add series</button>
+  </form>
+</section>
+
+{% if series %}
+<div class="grid">
+  {% for s in series %}
+  <a class="card" href="{{ url_for('series_page', series_id=s['id']) }}">
+    <div class="cover">
+      {% if s['cover'] %}
+      <img src="{{ s['cover'] }}" alt="" loading="lazy">
+      {% else %}
+      <div class="cover-fallback">{{ s['title'][:1] }}</div>
+      {% endif %}
+      {% if s['series_status'] %}<span class="badge">{{ s['series_status'] }}</span>{% endif %}
+    </div>
+    <h3>{{ s['title'] }}</h3>
+    <p class="muted">{{ s['authors'] or 'Unknown author' }}</p>
+    <p class="stats">
+      <span class="ok">{{ s['downloaded_count'] }} in Phoenix Records</span> ·
+      <span>{{ s['known_count'] }} known</span>
+      {% if s['locked_count'] %}· <span class="warn">{{ s['locked_count'] }} locked</span>{% endif %}
+    </p>
+    {% if s['last_ep'] %}
+    <p class="resume">Resume Ep {{ s['last_ep'] }} →</p>
+    {% endif %}
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">
+  <h2>No series yet</h2>
+  <p>Paste a webtoons.com series URL above. For example:</p>
+  <code>https://www.webtoons.com/en/action/auto-hunting-with-my-clones/list?title_no=5034</code>
+</div>
+{% endif %}
+{% endblock %}

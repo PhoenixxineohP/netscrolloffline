@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="empty">
+  <h2>Something went sideways</h2>
+  <p>{{ message }}</p>
+  <p><a href="{{ url_for('library') }}">Back to library</a></p>
+</section>
+{% endblock %}

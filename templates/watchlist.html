@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Watchlist & Priority — NetScrollOffline{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <h1>To-Do & Priority List</h1>
+    <p class="muted">Sorted by most episodes to unlock. Flag what it takes to read the rest
+      (Daily Pass quota, coins…) so you can plan your unlocking sessions.</p>
+  </div>
+  <form class="addrow" onsubmit="return false">
+    <button id="wl-import" type="button">📋 Import / update preset list</button>
+    <button id="wl-scan" type="button" class="primary">🔎 Scan to match all unmatched</button>
+    <span class="muted" id="wl-summary"></span>
+  </form>
+</section>
+
+<section class="jobbox" id="wl-jobbox" hidden>
+  <div class="jobline"><span id="wl-job-desc"></span><span id="wl-job-count"></span></div>
+  <div class="bar"><div id="wl-job-bar"></div></div>
+  <div class="jobmsg" id="wl-job-msg"></div>
+</section>
+
+<section class="eplist" id="wl-rows">
+  {% for w in rows %}
+  <div class="eprow wrow" data-id="{{ w['id'] }}">
+    <span class="no">{% if w['series_id'] %}📚{% else %}•{% endif %}</span>
+    <span class="ti">
+      <b>{{ w['name'] }}</b>
+      {% if w['match_status'] == 'matched' %}
+        <span class="muted">→
+          <a href="/series/{{ w['series_id'] }}" target="_blank">{{ w['title'] }}</a>
+          ({{ w['genre'].title().replace('-', '/') if w['genre'] else '?' }},
+          {% if w['ep_total_est'] %}~{{ w['ep_total_est'] }} eps{% else %}ep count unknown{% endif %},
+          {{ w['last_checked'][:10] }})
+        </span>
+      {% elif w['match_status'] == 'not_found' %}
+        <span class="pill locked">not on webtoons — needs another source</span>
+        {% if w['notes'] %}<span class="muted"> · {{ w['notes'] }}</span>{% endif %}
+      {% else %}
+        <span class="muted">not matched yet · {{ w['notes'] }}</span>
+      {% endif %}
+    </span>
+    <span class="unlock">
+      <select class="unlocksel" onchange="flag(this)">
+        <option value="unknown" {% if w['unlock_type'] == 'unknown' %}selected{% endif %}>unlock: ?</option>
+        <option value="free" {% if w['unlock_type'] == 'free' %}selected{% endif %}>unlock: free</option>
+        <option value="daily_pass" {% if w['unlock_type'] == 'daily_pass' %}selected{% endif %}>unlock: daily pass</option>
+        <option value="coins" {% if w['unlock_type'] == 'coins' %}selected{% endif %}>unlock: coins</option>
+        <option value="other" {% if w['unlock_type'] == 'other' %}selected{% endif %}>unlock: other</option>
+      </select>
+    </span>
+    <span class="btns">
+      {% if w['series_id'] %}
+        <a class="mini rnav" href="{{ url_for('series_page', series_id=w['series_id']) }}">Open</a>
+      {% elif w['match_status'] == 'matched' %}
+        <button class="mini act-add">➕ Library</button>
+      {% endif %}
+      <button class="mini act-rescan" title="Re-run the match for just this row">↻</button>
+      <button class="mini del act-remove" title="Remove from list">✕</button>
+    </span>
+  </div>
+  {% else %}
+  <p class="empty">Watchlist is empty — click <b>Import preset list</b>.</p>
+  {% endfor %}
+</section>
+
+<script>
+const W = (() => {
+  const rowsBox = document.getElementById('wl-rows');
+  const jobbox = document.getElementById('wl-jobbox');
+  const jobCount = document.getElementById('wl-job-count');
+  const jobBar = document.getElementById('wl-job-bar');
+  const jobMsg = document.getElementById('wl-job-msg');
+  const summary = document.getElementById('wl-summary');
+  form = body => { const f = new FormData(); for (const [k, v] of Object.entries(body)) f.append(k, v);
+    return fetch('/api/watchlist/' + k_, { method: 'POST', body: f }).then(r => r.json()); };
+  return {rowsBox, jobbox, jobCount, jobBar, jobMsg, summary, form};
+})();
+</script>
+</main>
+<script>
+/* (kept simple; logic below lives in watchlist.js) */
+</script>
+<script src="/static/watchlist.js"></script>
+{% endblock %}
