@@ -85,8 +85,72 @@ def list_url(parts: dict) -> str:
     return f"{base_url(parts)}/list?title_no={parts['title_no']}"
 
 
-def get_series_meta(parts: dict, cookie: str = None) -> dict:
-    """Fetch title/description/cover/episode list. Only web-visible episodes returned."""
+def _parse_episode_items(soup) -> list:
+    episodes = []
+    for li in soup.select("li._episodeItem"):
+        no = li.get("data-episode-no")
+        a = li.find("a", href=True)
+        span = li.select_one("span.subj")
+        if not (no and a):
+            continue
+        episodes.append({
+            "episode_no": int(no),
+            "title": span.get_text(strip=True) if span else li.get_text(" ", strip=True)[:120],
+            "url": a["href"].split(";")[0],
+        })
+    return episodes
+
+
+def crawl_episode_list(parts: dict, cookie: str = None, session=None,
+                       max_pages: int = 500, progress_cb=None) -> list:
+    """Walk the web episode list page by page and return the full back catalogue.
+
+    Webtoons shows ~9 episodes per list page and renders the pager in windows
+    of 10: at a window edge the "Next Page" anchor is missing even though more
+    pages exist. So following pg_next alone silently truncates the list (this
+    is why only the newest ~70 episodes were ever discovered). We therefore
+    probe page numbers sequentially and stop only at a page with no episodes.
+    """
+    s = session or requests.Session()
+    base = list_url(parts)
+    by_no = {}
+    page = 0
+    stale = 0
+    while page < max_pages:
+        page += 1
+        url = base if page == 1 else f"{base}&page={page}"
+        r = _get(s, url, cookie)
+        if r.status_code != 200:
+            if page == 1:
+                raise RuntimeError(
+                    f"webtoons.com returned HTTP {r.status_code} for the series page.")
+            break
+        items = _parse_episode_items(BeautifulSoup(r.text, "html.parser"))
+        added = 0
+        for ep in items:
+            if ep["episode_no"] not in by_no:
+                by_no[ep["episode_no"]] = ep
+                added += 1
+        if progress_cb:
+            progress_cb(page, len(by_no))
+        if added == 0:
+            # Past the end the site clamps to the final page, which repeats
+            # episodes we already have. Two stale pages in a row = done.
+            stale += 1
+            if stale >= 2:
+                break
+        else:
+            stale = 0
+    return [by_no[k] for k in sorted(by_no, reverse=True)]
+
+
+def get_series_meta(parts: dict, cookie: str = None, progress_cb=None,
+                    full: bool = False) -> dict:
+    """Fetch title/description/cover + episode list.
+
+    full=False returns only the newest page (fast, used when adding a series).
+    full=True crawls the whole back catalogue (used by refresh).
+    """
     s = requests.Session()
     url = list_url(parts)
     r = _get(s, url, cookie)
@@ -119,18 +183,14 @@ def get_series_meta(parts: dict, cookie: str = None) -> dict:
     if author_div:
         authors = author_div.get_text(" ", strip=True)
 
-    episodes = []
-    for li in soup.select("li._episodeItem"):
-        no = li.get("data-episode-no")
-        a = li.find("a", href=True)
-        span = li.select_one("span.subj")
-        if not (no and a):
-            continue
-        episodes.append({
-            "episode_no": int(no),
-            "title": span.get_text(strip=True) if span else li.get_text(" ", strip=True)[:120],
-            "url": a["href"].split(";")[0],
-        })
+    # Page 1 is already fetched; crawl the rest when the full catalogue is wanted.
+    episodes = _parse_episode_items(soup)
+    if full:
+        try:
+            episodes = crawl_episode_list(parts, cookie, session=s, progress_cb=progress_cb)
+        except RuntimeError:
+            if not episodes:
+                raise
 
     status = ""
     day_info = soup.find("p", class_="day_info")
@@ -209,26 +269,14 @@ def resolve_title_noURL(title_no: str) -> dict:
 
 
 def estimate_series(parts: dict, cookie: str = None) -> dict:
-    """Metadata + episode totals from the public list page(s).
+    """Metadata + episode estimate from the public list page.
 
-    Returns {title, authors, description, cover, cover_kind, status,
-             episodes, ep_total} where ep_total is the site-wide count.
+    Deliberately does NOT crawl the whole list: this runs once per candidate
+    during a watchlist scan, so it must stay cheap. max_episode_no is a good
+    estimate because webtoons numbers episodes sequentially.
     """
-    meta = get_series_meta(parts, cookie)
+    meta = get_series_meta(parts, cookie, full=False)
     total = len(meta["episodes"])
-    if meta["episodes"]:
-        # pages are 10-per-page, newest first; find the last page number
-        s = requests.Session()
-        r = _get(s, list_url(parts), cookie)
-        pages = [int(p) for p in
-                 re.findall(r"[?&]page=(\d+)", r.text)]
-        if pages:
-            last = max(pages)
-            if last > 1:
-                r2 = _get(s, f"{list_url(parts)}&page={last}", cookie)
-                soup2 = BeautifulSoup(r2.text, "html.parser")
-                total = (last - 1) * 10 + len(soup2.select("li._episodeItem"))
-        total = max(total, len(meta["episodes"]))
     meta["ep_total"] = max(total, meta.get("max_episode_no") or 0,
                            max((e["episode_no"] for e in meta["episodes"]), default=0))
     return meta

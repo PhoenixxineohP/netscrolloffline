@@ -1,7 +1,8 @@
 """NetScrollOffline - a small local web app for owning your webtoon library."""
 import os, re, time, queue, threading, json, urllib.parse, difflib
+import zipfile, tempfile, html, shutil
 from flask import (Flask, render_template, request, redirect, url_for,
-                   session, jsonify, Response, send_file, abort)
+                   session, jsonify, Response, send_file, send_from_directory, abort)
 import db
 import webtoon
 from requests.exceptions import RequestException
@@ -103,7 +104,7 @@ def _delay_ge_zero(name):
     return max(v, 0.0)
 
 
-def refresh_series_episodes(series_id):
+def refresh_series_episodes(series_id, progress_cb=None):
     """Recrawl the web episode list and upsert rows. Returns count found."""
     conn = db.connect()
     series = conn.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
@@ -126,7 +127,8 @@ def refresh_series_episodes(series_id):
             raise RuntimeError("Not enough info to rebuild the series URL; use a full"
                                " list or viewer URL when adding the series.")
 
-    meta = webtoon.get_series_meta(parts, cookie=get_cookie())
+    meta = webtoon.get_series_meta(parts, cookie=get_cookie(), full=True,
+                                   progress_cb=progress_cb)
     conn = db.connect()
     count = 0
     with conn:
@@ -149,6 +151,18 @@ def refresh_series_episodes(series_id):
             count += 1
     conn.close()
     return count
+
+
+def do_refresh(job_id, series_id):
+    """Background crawl of the full web episode list."""
+    _update_job(job_id, total=0, message="Fetching episode list…")
+
+    def progress(page, found):
+        _update_job(job_id, message=f"Page {page} · {found} episodes found")
+
+    count = refresh_series_episodes(series_id, progress_cb=progress)
+    _update_job(job_id, done=count, total=count,
+                message=f"{count} episodes in the list")
 
 
 def do_check_range(job_id, series_id, start, end):
@@ -174,8 +188,43 @@ def do_check_range(job_id, series_id, start, end):
             time.sleep(delay)
 
 
-def do_download(job_id, series_id, start, end):
+def _series_known_count(conn, series_id):
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM episodes WHERE series_id=?", (series_id,)).fetchone()["c"]
+
+
+def _series_looks_sparse(conn, series_id, max_no):
+    """True when the local episode list has big holes (only the newest page was
+    ever fetched). Fresh series get ~9 rows while max_episode_no is much higher."""
+    if max_no <= 20:
+        return False
+    have = _series_known_count(conn, series_id)
+    return have < max_no * 0.6
+
+
+def do_download(job_id, series_id, start, end, full=False):
     cookie = get_cookie()
+    conn = db.connect()
+    series = conn.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
+    sparse = bool(series) and _series_looks_sparse(conn, series_id,
+                                                   series["max_episode_no"] or 0)
+    conn.close()
+    if full or (sparse and start <= 1):
+        # "Download the whole series": always recrawl first so episodes added
+        # since the last refresh are included, and a series that only ever
+        # stored the newest page gets its back catalogue. On a sparse series
+        # we also do this for a partial range starting at 1.
+        _update_job(job_id, message="Refreshing the full episode list…")
+        refresh_series_episodes(
+            series_id,
+            progress_cb=lambda page, found: _update_job(
+                job_id, message=f"Episode list page {page} · {found} episodes"))
+        if full:
+            conn = db.connect()
+            row = conn.execute("SELECT max_episode_no FROM series WHERE id=?",
+                               (series_id,)).fetchone()
+            conn.close()
+            end = max(end, row["max_episode_no"] if row else end)
     conn = db.connect()
     rows = conn.execute(
         "SELECT e.*, s.title_no, s.slug, s.language, s.id AS sid FROM episodes e"
@@ -216,6 +265,168 @@ def do_download(job_id, series_id, start, end):
         _update_job(job_id, done=i + 1, message=msgs[-1])
         time.sleep(_delay_ge_zero("check_delay"))
     write_phoenix_records()
+
+
+# ---------------------------------------------------------------- export
+EXPORTS_DIR = os.path.join(db.BASE_DIR, "exports")
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+
+def _safe_name(name, fallback="untitled"):
+    name = re.sub(r"[\\/:*?\"<>|\r\n\t]+", " ", name or "").strip()
+    name = re.sub(r"\s+", " ", name)
+    return (name[:110] or fallback).rstrip(". ")
+
+
+def _comic_info(series, ep, page_count):
+    def e(v):
+        return html.escape(str(v if v is not None else ""))
+
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<ComicInfo xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" "
+        "xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n"
+        f"  <Title>{e(ep['title'] or 'Episode ' + str(ep['episode_no']))}</Title>\n"
+        f"  <Series>{e(series['title'])}</Series>\n"
+        f"  <Number>{e(ep['episode_no'])}</Number>\n"
+        f"  <Writer>{e(series['authors'])}</Writer>\n"
+        f"  <Summary>{e(series['description'][:4000])}</Summary>\n"
+        f"  <Genre>{e(series['genre_tags'])}</Genre>\n"
+        f"  <LanguageISO>{e(series['language'])}</LanguageISO>\n"
+        f"  <PageCount>{e(page_count)}</PageCount>\n"
+        f"  <Web>{e(ep['url'])}</Web>\n"
+        "</ComicInfo>\n"
+    )
+
+
+def _episode_images(series, ep_no):
+    d = db.episode_dir(series["title_no"], ep_no)
+    if not os.path.isdir(d):
+        return []
+    return [os.path.join(d, f) for f in sorted(os.listdir(d))
+            if f.lower().endswith(IMG_EXTS) and not f.startswith(".")]
+
+
+def do_export(job_id, series_id=None, fmt="cbz"):
+    """Bundle downloaded episodes into one downloadable ZIP.
+
+    fmt='cbz'  -> one .cbz comic archive per episode (Komga/Kavita friendly)
+    fmt='raw'  -> plain image folders
+    series_id=None exports every downloaded episode in the library.
+    """
+    conn = db.connect()
+    if series_id:
+        all_series = conn.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchall()
+    else:
+        all_series = conn.execute("SELECT * FROM series ORDER BY title COLLATE NOCASE").fetchall()
+    plan = []
+    for s in all_series:
+        eps = conn.execute(
+            "SELECT * FROM episodes WHERE series_id=? AND status='downloaded'"
+            " ORDER BY episode_no", (s["id"],)).fetchall()
+        for ep in eps:
+            imgs = _episode_images(s, ep["episode_no"])
+            if imgs:
+                plan.append((s, ep, imgs))
+    conn.close()
+
+    _update_job(job_id, total=len(plan))
+    if not plan:
+        _update_job(job_id, status="error",
+                    message="Nothing downloaded yet — run a download first.")
+        return
+
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    # Prune archives from earlier exports (older than a day) so repeated
+    # exports don't fill the disk.
+    cutoff = time.time() - 24 * 3600
+    for f in os.listdir(EXPORTS_DIR):
+        fp = os.path.join(EXPORTS_DIR, f)
+        try:
+            if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                os.remove(fp)
+        except OSError:
+            pass
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if series_id and len(all_series) == 1:
+        label = _safe_name(all_series[0]["title"], "series")
+    elif all_series:
+        label = "library"
+    else:
+        label = "library"
+    token = f"exp{int(time.time() * 1000)}"
+    out_path = os.path.join(EXPORTS_DIR, f"{label}-{stamp}-{token}.zip")
+
+    manifest = {"format": fmt, "generated": db.now(),
+                "episodes": []}
+    used_dirs = {}
+    try:
+        _write_export_zip(out_path, token, plan, fmt, manifest, used_dirs, job_id)
+    except Exception:
+        # Never leave a half-written archive behind for the download route.
+        EXPORTS.pop(token, None)
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        raise
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    _update_job(job_id, url=f"/api/export/{token}", size_mb=round(size_mb, 1),
+                filename=os.path.basename(out_path),
+                message=f"Export ready — {len(plan)} episode(s), {size_mb:.1f} MB")
+    EXPORTS[token] = out_path
+
+
+def _write_export_zip(out_path, token, plan, fmt, manifest, used_dirs, job_id):
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+        for i, (s, ep, imgs) in enumerate(plan):
+            if s["id"] not in used_dirs:
+                name = _safe_name(s["title"], s["title_no"])
+                if name in used_dirs.values():
+                    name = f"{name} [{s['title_no']}]"
+                used_dirs[s["id"]] = name
+            series_dir = used_dirs[s["id"]]
+            ep_no = ep["episode_no"]
+            ep_title = _safe_name(ep["title"] or f"Episode {ep_no}", f"Episode {ep_no}")
+            base = f"{series_dir}/{ep_no:04d} - {ep_title}"
+            if fmt == "cbz":
+                tmp_cbz = os.path.join(EXPORTS_DIR, f".tmp-{token}-{i:06d}.cbz")
+                try:
+                    with zipfile.ZipFile(tmp_cbz, "w", zipfile.ZIP_STORED) as c:
+                        for img in imgs:
+                            c.write(img, os.path.basename(img))
+                        c.writestr("ComicInfo.xml", _comic_info(s, ep, len(imgs)))
+                    z.write(tmp_cbz, base + ".cbz")
+                finally:
+                    if os.path.exists(tmp_cbz):
+                        os.remove(tmp_cbz)
+            else:
+                for img in imgs:
+                    z.write(img, f"{base}/{os.path.basename(img)}")
+                z.writestr(f"{base}/ComicInfo.xml", _comic_info(s, ep, len(imgs)))
+            manifest["episodes"].append({
+                "series": s["title"], "title_no": s["title_no"],
+                "episode": ep_no, "title": ep["title"],
+                "pages": len(imgs), "url": ep["url"],
+                "path": base + (".cbz" if fmt == "cbz" else "/"),
+            })
+            _update_job(job_id, done=i + 1,
+                        message=f"{s['title']} — ep {ep_no} ({len(imgs)} pages)")
+
+        z.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        z.writestr("README.txt", (
+            "NetScrollOffline export\n"
+            f"Format: {fmt}  ({'one .cbz per episode' if fmt == 'cbz' else 'image folders'})\n"
+            f"Episodes: {len(plan)}\n"
+            f"Generated: {manifest['generated']}\n\n"
+            "Drop the folders/.cbz files into Komga, Kavita, Calibre, or any comic "
+            "reader. manifest.json lists every episode and its source URL.\n"
+        ))
+
+
+EXPORTS = {}
 
 
 # ---------------------------------------------------------------- routes
@@ -336,17 +547,22 @@ def series_page(series_id):
     prog = {p["episode_no"]: p for p in conn.execute(
         "SELECT * FROM progress WHERE series_id=? AND profile_id=?",
         (series_id, profile["id"])).fetchall()}
+    sparse = _series_looks_sparse(conn, series_id, series["max_episode_no"] or 0)
     conn.close()
-    return render_template("series.html", s=series, eps=eps, known=known, prog=prog)
+    return render_template("series.html", s=series, eps=eps, known=known, prog=prog,
+                           sparse=sparse)
 
 
 @app.post("/api/series/<int:series_id>/refresh")
 def api_series_refresh(series_id):
-    try:
-        count = refresh_series_episodes(series_id)
-    except Exception as e:
-        return jsonify(error=str(e)), 500
-    return jsonify(ok=True, count=count)
+    conn = db.connect()
+    series = conn.execute("SELECT id FROM series WHERE id=?", (series_id,)).fetchone()
+    conn.close()
+    if not series:
+        return jsonify(error="Series not found."), 404
+    job_id = _new_job("Refreshing episode list")
+    JOB_QUEUE.put((job_id, lambda: do_refresh(job_id, series_id)))
+    return jsonify(ok=True, job=job_id)
 
 
 @app.post("/api/series/<int:series_id>/manual_add")
@@ -439,6 +655,7 @@ def api_download():
     sid = int(request.form.get("series_id") or 0)
     start = int(request.form.get("start", 1) or 1)
     end = int(request.form.get("end", 0) or 0)
+    full = request.form.get("full") in ("1", "true", "on")
     conn = db.connect()
     row = conn.execute("SELECT max_episode_no FROM series WHERE id=?", (sid,)).fetchone()
     conn.close()
@@ -447,8 +664,51 @@ def api_download():
     if not end:
         end = row["max_episode_no"]
     job_id = _new_job(f"download ser{sid} {start}-{end}")
-    JOB_QUEUE.put((job_id, lambda: do_download(job_id, sid, start, end)))
+    JOB_QUEUE.put((job_id, lambda: do_download(job_id, sid, start, end, full=full)))
     return jsonify(ok=True, job=job_id)
+
+
+@app.post("/api/export")
+def api_export():
+    sid = request.form.get("series_id") or None
+    try:
+        sid = int(sid) if sid else None
+    except (TypeError, ValueError):
+        return jsonify(error="Bad series id."), 400
+    fmt = request.form.get("format", "cbz")
+    if fmt not in ("cbz", "raw"):
+        fmt = "cbz"
+    if sid:
+        conn = db.connect()
+        ok = conn.execute("SELECT 1 FROM series WHERE id=?", (sid,)).fetchone()
+        conn.close()
+        if not ok:
+            return jsonify(error="Unknown series."), 404
+    desc = f"export {'ser' + str(sid) if sid else 'library'} {fmt}"
+    job_id = _new_job(desc)
+    JOB_QUEUE.put((job_id, lambda: do_export(job_id, sid, fmt)))
+    return jsonify(ok=True, job=job_id)
+
+
+@app.get("/api/export/<token>")
+def api_export_download(token):
+    if not re.fullmatch(r"exp\d+", token):
+        abort(404)
+    path = EXPORTS.get(token)
+    if path is None or not os.path.isfile(path):
+        # Survive a server restart: recover the archive by its token in the name.
+        path = None
+        if os.path.isdir(EXPORTS_DIR):
+            for f in os.listdir(EXPORTS_DIR):
+                if token in f and f.endswith(".zip"):
+                    cand = os.path.join(EXPORTS_DIR, f)
+                    if os.path.isfile(cand):
+                        path = cand
+                        break
+        if path is None:
+            abort(404)
+    return send_from_directory(EXPORTS_DIR, os.path.basename(str(path)),
+                               as_attachment=True)
 
 
 @app.get("/api/job/<job_id>")

@@ -17,6 +17,8 @@
     <button id="btn-savefree" class="primary">⬇ Save to Phoenix Records (PC)</button>
     <button id="btn-check">Check availability (range)</button>
     <button id="btn-device-range" title="Copy episodes into THIS device's storage for offline reading">📱 Save range to this device</button>
+    <button id="btn-export-cbz" title="Bundle this series' downloaded episodes into .cbz files for Komga/Kavita">📦 Export series as CBZ</button>
+    <button id="btn-export-raw" title="Export this series as plain image folders">📦 Export series as folders</button>
     <span class="muted" id="device-note"></span>
     <details class="row">
       <summary>Quick metadata edit</summary>
@@ -60,7 +62,13 @@
     <div class="jobmsg" id="job-msg"></div>
   </section>
 
-{% if s['max_episode_no'] and s['max_episode_no'] > known %}
+{% if sparse %}
+<p class="notice warn">
+  Only {{ known }} of the {{ s['max_episode_no'] }} episodes on this series are stored locally —
+  the full web list hasn't been crawled yet. Hit <b>↻ Refresh episode list</b> (or start a
+  download; it refreshes automatically) to fetch the whole back catalogue.
+</p>
+{% elif s['max_episode_no'] and s['max_episode_no'] > known %}
 <p class="notice warn">
   The site's web episode list only exposes {{ known }} episode(s) here, while the app shows
   {{ s['max_episode_no'] }}. That means the rest are app-only / Daily Pass / Fast Pass for your

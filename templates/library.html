@@ -12,6 +12,24 @@
 </section>
 
 {% if series %}
+<section class="jobbox" id="exportbox" data-series-id="">
+  <div class="jobline">
+    <b>Export for self-hosting</b>
+    <span class="muted">Bundle everything already in Phoenix Records into one archive</span>
+  </div>
+  <div class="actions" style="margin:0 0 10px">
+    <button data-format="cbz" class="primary" title="One .cbz per episode — drop into Komga/Kavita/Calibre">⬇ Download all as CBZ</button>
+    <button data-format="raw" title="Plain per-episode image folders with ComicInfo.xml">⬇ Download all as image folders</button>
+    <a class="exp-link" hidden></a>
+  </div>
+  <div class="bar exp-bar"><div></div></div>
+  <div class="jobline" style="margin-top:8px">
+    <span class="muted exp-count"></span>
+    <span class="muted exp-status" hidden></span>
+  </div>
+  <div class="jobmsg exp-msg"></div>
+</section>
+
 <div class="grid">
   {% for s in series %}
   <a class="card" href="{{ url_for('series_page', series_id=s['id']) }}">
@@ -43,4 +61,7 @@
   <code>https://www.webtoons.com/en/action/auto-hunting-with-my-clones/list?title_no=5034</code>
 </div>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='export.js') }}"></script>
 {% endblock %}

@@ -19,6 +19,12 @@ function poll() {
     if (j.message) jobMsg.textContent = j.message;
     if (j.status === 'done' || j.status === 'error') {
       clearInterval(pollTimer); pollTimer = null; activeJob = null;
+      if (j.status === 'error') {
+        alert(j.message || 'The job failed.');
+        const btn = document.getElementById('btn-refresh');
+        if (btn) { btn.disabled = false; }
+        return;
+      }
       setTimeout(() => location.reload(), 900);
     }
   }).catch(() => { clearInterval(pollTimer); pollTimer = null; activeJob = null; });
@@ -113,20 +119,15 @@ document.getElementById('btn-device-range').addEventListener('click', async () =
 
 /* ---------- server buttons ---------- */
 document.getElementById('btn-refresh').addEventListener('click', (e) => {
-  e.target.disabled = true; e.target.textContent = 'Refreshing…';
-  fetch(`/api/series/${SID}/refresh`, { method: 'POST' })
-    .then(r => r.json())
-    .then(res => {
-      if (res.error) { alert(res.error); e.target.disabled = false; e.target.textContent = '↻ Refresh episode list'; return; }
-      if (res.count === 0) {
-        alert('The web list showed 0 episodes. If the series is app-only, add episode numbers manually under the details form below.');
-      }
-      location.reload();
-    }).catch(() => alert('Refresh failed (network?).'));
+  e.target.disabled = true;
+  startJob(`/api/series/${SID}/refresh`, {});
+  /* startJob alerts and polls; re-enable the button when the page reloads. */
 });
 
 document.getElementById('btn-savefree').addEventListener('click', () => {
-  startJob('/api/download', { series_id: SID, start: 1, end: 0 });
+  /* full=1 makes the server recrawl the whole episode list first, so this
+     really is "download the entire series", not just what's already stored. */
+  startJob('/api/download', { series_id: SID, start: 1, end: 0, full: 1 });
 });
 
 document.getElementById('btn-check').addEventListener('click', () => {
@@ -134,6 +135,56 @@ document.getElementById('btn-check').addEventListener('click', () => {
   if (!end) return;
   startJob(`/api/series/${SID}/check`, { start: 1, end: end });
 });
+
+/* ---------- bulk export (CBZ / folders) ---------- */
+let exportTimer = null;
+let exportJob = null;
+let exportStarting = false;
+function startExport(fmt) {
+  if (exportTimer || exportStarting) return;
+  exportStarting = true;
+  startJobExport(fmt);
+}
+
+function startJobExport(fmt) {
+  post('/api/export', { series_id: SID, format: fmt }).then(res => {
+    exportStarting = false;
+    if (res.error) { alert(res.error); return; }
+    exportJob = res.job;
+    jobbox.hidden = false;
+    jobDesc.textContent = `Exporting series as ${fmt === 'cbz' ? 'CBZ' : 'image folders'}`;
+    jobMsg.textContent = 'Building archive…';
+    jobBar.style.width = '0%';
+    jobCount.textContent = '';
+    exportTimer = setInterval(pollExport, 600);
+    pollExport();
+  }).catch(() => { exportStarting = false; alert('Could not start export.'); });
+}
+
+function pollExport() {
+  if (!exportJob) { clearInterval(exportTimer); exportTimer = null; return; }
+  fetch(`/api/job/${exportJob}`).then(r => r.json()).then(j => {
+    if (!j || !j.id) { clearInterval(exportTimer); exportTimer = null; return; }
+    const pct = j.total ? Math.round(100 * j.done / j.total) : 0;
+    jobCount.textContent = j.total ? `${j.done}/${j.total} (${pct}%)` : '';
+    jobBar.style.width = pct + '%';
+    if (j.message) jobMsg.textContent = j.message;
+    if (j.status === 'done' || j.status === 'error') {
+      clearInterval(exportTimer); exportTimer = null; exportJob = null;
+      if (j.status === 'done' && j.url) {
+        jobMsg.textContent = `${j.message}\nDownloading ${j.filename}…`;
+        const a = document.createElement('a');
+        a.href = j.url; a.download = j.filename || '';
+        document.body.appendChild(a); a.click(); a.remove();
+      } else if (j.status === 'error') {
+        jobMsg.textContent = j.message || 'Export failed.';
+      }
+    }
+  }).catch(() => { clearInterval(exportTimer); exportTimer = null; exportJob = null; });
+}
+
+document.getElementById('btn-export-cbz').addEventListener('click', () => startExport('cbz'));
+document.getElementById('btn-export-raw').addEventListener('click', () => startExport('raw'));
 
 document.getElementById('btn-manual').addEventListener('click', () => {
   const f = document.getElementById('manual-form');

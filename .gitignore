@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Runtime state, never commit
+data/
+downloads/
+exports/
+*.db
+*.sqlite3
+
+.venv/
+venv/

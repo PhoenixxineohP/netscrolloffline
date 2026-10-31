@@ -78,16 +78,40 @@ is never affected by any device.
 - Some titles are fully app-only; the web viewer answers "Connect Error" for those, and
   the app will honestly mark them as not readable. Nothing smuggled, just accurate status.
 
+## Bulk export for self-hosting
+
+Everything already saved in Phoenix Records can be bundled into a single archive,
+ready to drop into a self-hosted comic server (Komga, Kavita, Calibre, Tachiyomi,
+or plain folders).
+
+- **Library page** → *Download all as CBZ* or *Download all as image folders*
+  exports the whole archive at once.
+- **A series page** → *Export series as CBZ / folders* exports just that title.
+
+Formats:
+
+- **CBZ** — one `.cbz` per episode, each with a `ComicInfo.xml` (series, episode
+  number, title, author, summary, page count, source URL). Folder layout is
+  `Series Title/0001 - Episode Title.cbz`. Most comic servers index this directly.
+- **Image folders** — plain `Series Title/0001 - Episode Title/000.jpg …` plus
+  `ComicInfo.xml` per episode, for readers or scripts that want loose files.
+
+Both include a top-level `manifest.json` listing every episode, page count and
+source URL, plus a `README.txt`. The ZIP is built in the background with a
+progress bar, then downloaded automatically. Archives live in `exports/` and are
+cleaned automatically after a day.
+
 ## Layout
 
 ```
-app.py          Flask server + background download jobs
+app.py          Flask server + background download/export jobs
 webtoon.py      webtoons.com list/viewer parsing and image downloader
 db.py           SQLite schema (series, episodes, progress per profile, settings)
 templates/      Library, series detail, reader, settings pages
 static/         CSS + reader scroll-progress script
 data/           netscroll.db (auto-created) + secret key
 downloads/      per-series image folders (auto-created)
+exports/        temporary bulk-export ZIPs (auto-created, pruned)
 ```
 
 ## Being polite & staying safe
