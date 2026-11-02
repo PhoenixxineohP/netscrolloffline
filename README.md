@@ -41,6 +41,40 @@ Then open **http://127.0.0.1:8767** in your browser.
 4. **Read** — the reader scrolls vertically like a webtoon; your position auto-saves per
    profile and auto-restores when you reopen the episode. The Library card shows "Resume".
 
+## Bringing back downloads from an older install
+
+The Library page is built from the database (`data/netscroll.db`); the pages themselves
+live in `downloads/<series>/ep_0001/`. If you copy an old install's `downloads/` folder
+without its `data/` folder — or move to a new PC, or start from a fresh clone, since
+`data/` and `downloads/` are both gitignored — the pages are all on disk but the library
+looks empty. Nothing is lost; the app just doesn't know about them yet.
+
+**In the app:** Library → **Import existing downloads**. The path box already points at
+your `downloads/` folder, but you can paste any folder — an old app folder, an external
+drive, a backup. Leave *Look up titles and covers online* ticked to fill in real titles
+and cover art; untick it to work fully offline (you get readable placeholders like
+"WEBTOON #95" that a later **↻ Refresh** will replace). It runs as a background job with
+progress, so a large library can be left to finish.
+
+**From a terminal** (works even if the app won't start):
+
+```bash
+python import_downloads.py --dry-run          # show what it would import
+python import_downloads.py                    # import ./downloads
+python import_downloads.py /old/app           # descends into <that>/downloads
+python import_downloads.py /old/downloads --no-lookup
+```
+
+It accepts the app folder, a `downloads` folder, or a single series folder, and recognises
+the old unpadded (`ep_1`) and bare-numeric (`12`) episode folder names as well as the
+current `ep_0001`.
+
+Safe by design: it never deletes or moves files, never overwrites an existing real title
+with a placeholder, never downgrades an episode already marked downloaded, and running it
+twice adds nothing the second time. Episodes that still contain `.part` files are imported
+as **unknown** rather than **downloaded**, so they can be fetched again instead of showing
+a half-broken episode.
+
 ## On your phone / Fire tablet
 
 The PC is the archive; devices are light clients.
@@ -216,7 +250,9 @@ cleaned automatically after a day.
 ```
 app.py          Flask server + background download/export jobs
 webtoon.py      webtoons.com list/viewer parsing and image downloader
-sources.py      source layer: WEBTOON editions + MangaDex API
+sources.py      source layer: WEBTOON editions + MangaDex API + Tapas
+localimport.py  adopts already-downloaded folders back into the library
+import_downloads.py  CLI for the same import (works without the web UI)
 net.py          shared per-host rate limiter and polite HTTP client
 scanner.py      downloaded-page validation and optional antivirus scanning
 limittest.py    measures real throughput and rate-limit thresholds
@@ -226,7 +262,7 @@ static/         CSS + reader scroll-progress and queue scripts
 data/           netscroll.db (auto-created) + secret key
 downloads/      per-series image folders (auto-created)
 exports/        temporary bulk-export ZIPs (auto-created, pruned)
-tests/          offline tests (python tests/test_queue.py, python tests/test_sources.py)
+tests/          offline tests (test_queue.py, test_sources.py, test_import.py)
 ```
 
 ## Being polite & staying safe

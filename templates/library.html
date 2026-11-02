@@ -37,6 +37,27 @@
   <div id="br-results" class="br-results"></div>
 </section>
 
+<section class="jobbox" id="importbox">
+  <div class="jobline">
+    <b>Import existing downloads</b>
+    <span class="muted">Add episodes already saved on this PC (for example from an older install) back into the library</span>
+  </div>
+  <div class="actions" style="margin:0 0 10px">
+    <input type="text" id="imp-path" placeholder="{{ downloads_dir }}" value="{{ downloads_dir }}">
+    <label class="inline-toggle">
+      <input type="checkbox" id="imp-lookup" checked>
+      <span>Look up titles and covers online</span>
+    </label>
+    <button type="button" id="imp-go" class="primary">Scan and import</button>
+  </div>
+  <div class="bar exp-bar" id="imp-bar"><div></div></div>
+  <div class="jobline" style="margin-top:8px">
+    <span class="muted" id="imp-count"></span>
+    <span class="muted" id="imp-status" hidden></span>
+  </div>
+  <div class="jobmsg" id="imp-msg"></div>
+</section>
+
 {% if series %}
 <section class="jobbox" id="exportbox" data-series-id="">
   <div class="jobline">
@@ -104,4 +125,5 @@
 <script src="{{ url_for('static', filename='export.js') }}"></script>
 <script src="{{ url_for('static', filename='queuebulk.js') }}"></script>
 <script src="{{ url_for('static', filename='browse.js') }}"></script>
+<script src="{{ url_for('static', filename='import.js') }}"></script>
 {% endblock %}

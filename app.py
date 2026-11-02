@@ -8,6 +8,7 @@ import webtoon
 import sources
 import net
 import scanner
+import localimport
 from requests.exceptions import RequestException
 
 app = Flask(__name__)
@@ -837,6 +838,53 @@ def _write_export_zip(out_path, token, plan, fmt, manifest, used_dirs, job_id):
 EXPORTS = {}
 
 
+# ---------------------------------------------------------------- local import
+
+def do_import_local(job_id, found, lookup=True):
+    """Adopt already-downloaded folders into the library database.
+
+    ``found`` comes from :func:`localimport.scan` so the folder tree is walked
+    once (the route returns the counts to the UI immediately).
+    """
+    total_eps = sum(len(s["episodes"]) for s in found)
+    _update_job(job_id, total=len(found), done=0,
+                message=f"Found {len(found)} series, {total_eps} episode(s)")
+
+    def progress(index, total, title):
+        _check_cancel(job_id)
+        _update_job(job_id, done=index, total=total,
+                    message=f"Importing {title} ({index}/{total})")
+
+    stats = localimport.adopt(found, lookup=lookup, progress=progress)
+    write_phoenix_records()
+    _update_job(
+        job_id, done=stats["series"], total=stats["series"],
+        message=(f"Imported {stats['new_episodes']} new episode(s) across "
+                 f"{stats['new_series']} new series "
+                 f"({stats['bytes'] / 1048576:.1f} MB on disk)"))
+
+
+@app.post("/api/library/import")
+def api_library_import():
+    """Scan a folder of existing downloads and adopt it into the library."""
+    root = (request.form.get("path") or "").strip() or db.DOWNLOADS_DIR
+    lookup = (request.form.get("lookup") or "").strip().lower() in (
+        "1", "true", "on", "yes")
+    try:
+        found = localimport.scan(root)
+    except localimport.ImportError_ as exc:
+        return jsonify(error=str(exc)), 400
+    if not found:
+        return jsonify(error="No downloaded episodes were found there. Expected "
+                             "folders like downloads/<series>/ep_0001/*.jpg."), 404
+    job_id = _new_job(
+        f"Import existing downloads ({len(found)} series)", kind="import",
+        params={"path": root, "lookup": lookup},
+        fn=lambda: do_import_local(job_id, found, lookup))
+    return jsonify(ok=True, job=job_id, series=len(found),
+                   episodes=sum(len(s["episodes"]) for s in found))
+
+
 # ---------------------------------------------------------------- routes
 
 @app.context_processor
@@ -872,7 +920,8 @@ def library():
     conn.close()
     return render_template("library.html", series=series_rows,
                            locales=sources.WEBTOON_LOCALES,
-                           genres=sources.WEBTOON_GENRES)
+                           genres=sources.WEBTOON_GENRES,
+                           downloads_dir=db.DOWNLOADS_DIR)
 
 
 @app.post("/api/profile/switch")

@@ -245,15 +245,23 @@ def resolve_title_noURL(title_no: str) -> dict:
 
     Uses the webapp-legacy endpoint https://www.webtoons.com/episodeList?titleNo=N
     which 301-redirects to the canonical /{lang}/{genre}/{slug}/list URL.
-    Returns {language, genre, slug, title_no} or raises RuntimeError.
+    Returns {language, lang, genre, slug, title_no} or raises RuntimeError.
+
+    ``lang`` is included alongside ``language`` because the rest of this module
+    (:func:`base_url`, :func:`get_series_meta`) expects ``lang``; returning only
+    ``language`` made every title_no-based metadata fetch raise KeyError.
     """
     s = requests.Session()
-    r = _get(s, f"https://www.webtoons.com/episodeList?titleNo={title_no}")
-    final = r.url
-    m = re.search(r"webtoons\.com/([a-z]{2})/([a-z0-9-]+)/([^/]+)/list", final)
+    try:
+        r = _get(s, f"https://www.webtoons.com/episodeList?titleNo={title_no}")
+        final = r.url
+    finally:
+        s.close()
+    m = re.search(r"webtoons\.com/([a-z]{2}(?:-[a-z]+)?)/([a-z0-9-]+)/([^/]+)/list", final)
     if not m:
         raise RuntimeError(f"Could not resolve a URL for title_no {title_no}.")
-    return {"language": m.group(1), "genre": m.group(2),
+    lang = m.group(1)
+    return {"language": lang, "lang": lang, "genre": m.group(2),
             "slug": m.group(3), "title_no": str(title_no)}
 
 
