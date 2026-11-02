@@ -1,10 +1,13 @@
 """NetScrollOffline - a small local web app for owning your webtoon library."""
-import os, re, time, queue, threading, json, urllib.parse, difflib
+import os, re, time, threading, json, urllib.parse, difflib
 import zipfile, tempfile, html, shutil
 from flask import (Flask, render_template, request, redirect, url_for,
                    session, jsonify, Response, send_file, send_from_directory, abort)
 import db
 import webtoon
+import sources
+import net
+import scanner
 from requests.exceptions import RequestException
 
 app = Flask(__name__)
@@ -19,9 +22,23 @@ with open(_key_path, "rb") as f:
     app.secret_key = f.read()
 
 # ---------------------------------------------------------------- background jobs
+# A small in-memory job queue with an adjustable number of concurrency "slots",
+# cancellation, pausing and automatic retry of failed jobs. Job records stay in
+# memory until they are cleared from the Queue page.
 JOBS = {}
-JOB_QUEUE = queue.Queue()
-JOB_LOCK = threading.Lock()
+JOBS_LOCK = threading.RLock()
+DISPATCH = threading.Condition(JOBS_LOCK)
+QUEUE = {"slots": 2, "paused": False, "auto_retry": True, "max_attempts": 3}
+QUEUE_HIDDEN = ("fn", "cancel")
+RETRY_DELAY = 20.0
+
+
+class JobCancelled(Exception):
+    """Raised from inside a job body when the user cancels that job."""
+
+
+class JobError(Exception):
+    """Raised from inside a job body to mark the job as failed (and retryable)."""
 
 
 def get_setting(key, default=""):
@@ -59,41 +76,234 @@ def current_profile():
     return row
 
 
-def _job_status(job_id):
-    with JOB_LOCK:
-        return dict(JOBS[job_id]) if job_id in JOBS else None
+_QUEUE_SETTINGS_LOADED = False
 
 
-def _update_job(job_id, **fields):
-    with JOB_LOCK:
-        JOBS[job_id].update(fields)
+def _load_queue_settings():
+    """Restore queue preferences saved in the settings table."""
+    global _QUEUE_SETTINGS_LOADED
+    if _QUEUE_SETTINGS_LOADED:
+        return
+    _QUEUE_SETTINGS_LOADED = True
+    try:
+        slots = int(get_setting("queue_slots", "2") or 2)
+    except ValueError:
+        slots = 2
+    try:
+        attempts = int(get_setting("queue_max_attempts", "3") or 3)
+    except ValueError:
+        attempts = 3
+    auto = (get_setting("queue_auto_retry", "1") or "1").lower() in ("1", "true", "on", "yes")
+    with JOBS_LOCK:
+        QUEUE["slots"] = max(1, min(8, slots))
+        QUEUE["max_attempts"] = max(1, min(20, attempts))
+        QUEUE["auto_retry"] = auto
 
 
-def _new_job(desc):
-    with JOB_LOCK:
-        job_id = f"job{(max((int(k[3:]) for k in JOBS), default=0) + 1)}"
-        JOBS[job_id] = {"id": job_id, "status": "queued", "desc": desc, "done": 0,
-                        "total": 0, "messages": []}
+def _save_queue_settings():
+    set_setting("queue_slots", str(QUEUE["slots"]))
+    set_setting("queue_max_attempts", str(QUEUE["max_attempts"]))
+    set_setting("queue_auto_retry", "1" if QUEUE["auto_retry"] else "0")
+
+
+def _series_label(series_id):
+    """Human-readable series name for job descriptions."""
+    if not series_id:
+        return ""
+    conn = db.connect()
+    row = conn.execute("SELECT title FROM series WHERE id=?", (series_id,)).fetchone()
+    conn.close()
+    return (row["title"] if row else f"series {series_id}").strip()
+
+
+def _new_job(desc, fn=None, kind="task", series_id=None, params=None,
+             max_attempts=None, auto_retry=None):
+    """Create a job record and queue it. The dispatcher starts it when a slot frees up."""
+    _load_queue_settings()
+    with JOBS_LOCK:
+        if max_attempts is None:
+            max_attempts = QUEUE["max_attempts"]
+        if auto_retry is None:
+            auto_retry = QUEUE["auto_retry"]
+        job_id = f"job{(max((int(k[3:]) for k in JOBS if k[3:].isdigit()), default=0) + 1)}"
+        JOBS[job_id] = {
+            "id": job_id, "kind": kind, "desc": desc, "series_id": series_id,
+            "params": params or {}, "fn": fn,
+            "status": "queued", "done": 0, "total": 0,
+            "message": "Queued", "messages": [], "error": "", "failed": 0,
+            "attempts": 0, "max_attempts": max(1, int(max_attempts)),
+            "auto_retry": bool(auto_retry), "retry_at": 0.0,
+            "retry_delay": RETRY_DELAY,
+            "cancel": False,
+            "created_at": time.time(), "started_at": None, "finished_at": None,
+        }
+        DISPATCH.notify_all()
     return job_id
 
 
-def worker():
-    while True:
-        job_id, fn = JOB_QUEUE.get()
-        _update_job(job_id, status="running")
+def _job_status(job_id):
+    """Public view of a job (never exposes the callable, which JSON can't encode)."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return _job_dict(job) if job else None
+
+
+def _update_job(job_id, **fields):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(fields)
+        DISPATCH.notify_all()
+
+
+def _job_cancel_requested(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return bool(job and job.get("cancel"))
+
+
+def _check_cancel(job_id, message="Cancelled"):
+    """Called from inside a job body so long loops stop promptly."""
+    if _job_cancel_requested(job_id):
+        raise JobCancelled(message)
+
+
+def _sleep_or_cancel(job_id, seconds):
+    """Sleep in small slices so a cancel request takes effect quickly."""
+    if seconds <= 0:
+        _check_cancel(job_id)
+        return
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        _check_cancel(job_id)
+        time.sleep(min(0.25, max(0.0, deadline - time.time())))
+    _check_cancel(job_id)
+
+
+def _job_dict(job, include_private=False):
+    data = {k: v for k, v in job.items() if include_private or k not in QUEUE_HIDDEN}
+    data.pop("retry_delay", None)
+    return data
+
+
+def _queue_snapshot():
+    with JOBS_LOCK:
+        jobs = [_job_dict(j) for j in JOBS.values()]
+        running = sum(1 for j in JOBS.values() if j["status"] == "running")
+        return {
+            "jobs": jobs,
+            "slots": QUEUE["slots"],
+            "running": running,
+            "paused": QUEUE["paused"],
+            "auto_retry": QUEUE["auto_retry"],
+            "max_attempts": QUEUE["max_attempts"],
+            "queued": sum(1 for j in JOBS.values() if j["status"] == "queued"),
+        }
+
+
+def _finalize_job(job_id, status, error=""):
+    """Settle a finished job, scheduling an automatic retry when appropriate."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["finished_at"] = time.time()
+        job["error"] = error or job.get("error", "")
+        retryable = job["kind"] in ("download", "refresh", "check", "export", "watchlist")
+        partial_failure = job["kind"] == "download" and job["failed"] > 0
+        if status == "done" and partial_failure:
+            status = "error"
+            job["error"] = job["error"] or f"{job['failed']} episode(s) failed"
+            job["message"] = f"Finished with {job['failed']} failed episode(s)"
+        wants_retry = job["auto_retry"] and retryable and not job["cancel"] and (
+            status == "error" or partial_failure)
+        if wants_retry and job["attempts"] < job["max_attempts"]:
+            # Back off a little each time, but never wait more than 5 minutes.
+            delay = min(job["retry_delay"] * job["attempts"], 300.0)
+            job["status"] = "queued"
+            job["retry_at"] = time.time() + delay
+            job["failed"] = 0
+            job["done"] = 0
+            job["message"] = (f"Auto-retry in {int(delay)}s "
+                              f"(attempt {job['attempts'] + 1}/{job['max_attempts']})")
+            job["finished_at"] = None
+        else:
+            job["status"] = status
+            if status == "done":
+                job["error"] = ""
+                if not job["message"] or job["message"].startswith("Starting"):
+                    job["message"] = "Finished"
+            elif status == "cancelled":
+                job["message"] = "Cancelled"
+            elif status == "error":
+                job["message"] = job["error"] or "Failed"
+        DISPATCH.notify_all()
+
+
+def _start_job(job_id):
+    """Run one job in its own thread (called by the dispatcher under a free slot)."""
+    def runner():
+        with JOBS_LOCK:
+            raw = JOBS.get(job_id)
+            fn = raw.get("fn") if raw else None
         try:
-            fn()
-        except Exception as e:  # never let the worker die
-            _update_job(job_id, status="error", message=str(e))
+            if fn is not None:
+                fn()
+        except JobCancelled:
+            _finalize_job(job_id, "cancelled", "Cancelled")
+        except JobError as e:
+            _finalize_job(job_id, "error", str(e)[:400])
+        except Exception as e:  # never let a job thread die silently
             import traceback
             traceback.print_exc()
+            _finalize_job(job_id, "error", str(e)[:400] or e.__class__.__name__)
         else:
-            st = _job_status(job_id)
-            if st["status"] == "running":
-                _update_job(job_id, status="done")
+            st = _job_status(job_id) or {}
+            if st.get("status") == "running":
+                if _job_cancel_requested(job_id):
+                    _finalize_job(job_id, "cancelled", "Cancelled")
+                else:
+                    _finalize_job(job_id, "done")
+
+    threading.Thread(target=runner, daemon=True, name=f"job-{job_id}").start()
 
 
-threading.Thread(target=worker, daemon=True).start()
+def _dispatcher():
+    """Starts queued jobs while respecting the slot limit, pause flag and retry delays."""
+    while True:
+        with DISPATCH:
+            while True:
+                if QUEUE["paused"]:
+                    DISPATCH.wait(0.5)
+                    continue
+                running = sum(1 for j in JOBS.values() if j["status"] == "running")
+                slots = QUEUE["slots"]
+                now = time.time()
+                ready = None
+                soonest = None
+                for job in sorted(JOBS.values(), key=lambda j: j["created_at"]):
+                    if job["status"] != "queued":
+                        continue
+                    if job["retry_at"] and job["retry_at"] > now:
+                        soonest = job["retry_at"] if soonest is None else min(soonest, job["retry_at"])
+                        continue
+                    ready = job
+                    break
+                if ready is not None and running < slots:
+                    ready["status"] = "running"
+                    ready["attempts"] += 1
+                    ready["started_at"] = ready["started_at"] or now
+                    ready["retry_at"] = 0.0
+                    ready["message"] = f"Starting (attempt {ready['attempts']}/{ready['max_attempts']})"
+                    job_id = ready["id"]
+                    break
+                timeout = 0.5
+                if soonest is not None:
+                    timeout = max(0.05, min(timeout, soonest - now))
+                DISPATCH.wait(timeout)
+        _start_job(job_id)
+
+
+threading.Thread(target=_dispatcher, daemon=True, name="job-dispatcher").start()
 
 
 def _delay_ge_zero(name):
@@ -104,13 +314,22 @@ def _delay_ge_zero(name):
     return max(v, 0.0)
 
 
+def _setting_bool(name, default=False):
+    raw = (get_setting(name, "1" if default else "0") or "").strip().lower()
+    return raw in ("1", "true", "on", "yes")
+
+
 def refresh_series_episodes(series_id, progress_cb=None):
-    """Recrawl the web episode list and upsert rows. Returns count found."""
+    """Recrawl the episode list for this series' source and upsert rows."""
     conn = db.connect()
     series = conn.execute("SELECT * FROM series WHERE id=?", (series_id,)).fetchone()
     conn.close()
     if not series:
         raise RuntimeError("series not found")
+    if (series["source"] or "webtoon") == "mangadex":
+        return _refresh_mangadex_series(series, progress_cb)
+    if (series["source"] or "webtoon") == "tapas":
+        return _refresh_tapas_series(series, progress_cb)
     parts = {"lang": series["language"], "genre": series["genre"],
              "slug": series["slug"], "title_no": series["title_no"]}
     if not parts["genre"]:
@@ -153,11 +372,91 @@ def refresh_series_episodes(series_id, progress_cb=None):
     return count
 
 
+def _refresh_mangadex_series(series, progress_cb=None):
+    """Re-read a MangaDex title's metadata and English chapter list."""
+    manga_id = series["source_ref"] or series["slug"]
+    r = sources._mdx_get(f"{sources.MANGADEX_API}/manga/{manga_id}"
+                         "?includes[]=cover_art&includes[]=author")
+    data = (r.json() or {}).get("data") or {}
+    attrs = data.get("attributes") or {}
+    title_map = attrs.get("title") or {}
+    if progress_cb:
+        progress_cb(1, 0)
+    chapters = sources.mangadex_chapters(manga_id, language="en")
+    conn = db.connect()
+    count = 0
+    try:
+        with conn:
+            cover = ""
+            for rel in data.get("relationships") or []:
+                if rel.get("type") == "cover_art":
+                    fn = (rel.get("attributes") or {}).get("fileName")
+                    if fn:
+                        cover = f"https://uploads.mangadex.org/covers/{manga_id}/{fn}.512.jpg"
+            conn.execute(
+                "UPDATE series SET title=coalesce(nullif(?,''),title),"
+                " description=coalesce(nullif(?,''),description),"
+                " cover=coalesce(nullif(?,''),cover),"
+                " series_status=coalesce(nullif(?,''),series_status), last_checked=?"
+                " WHERE id=?",
+                (title_map.get("en") or next(iter(title_map.values()), ""),
+                 ((attrs.get("description") or {}).get("en") or "")[:4000],
+                 cover, (attrs.get("status") or "").upper(), db.now(), series["id"]))
+            for ch in chapters:
+                conn.execute(
+                    "INSERT INTO episodes (series_id, episode_no, title, url, known, status)"
+                    " VALUES (?,?,?,?,1,'unknown') ON CONFLICT(series_id, episode_no)"
+                    " DO UPDATE SET known=1, title=excluded.title, url=excluded.url",
+                    (series["id"], ch["episode_no"],
+                     ch["title"] or f"Chapter {ch['episode_no']}", ch["id"]))
+                count += 1
+                if progress_cb and count % 25 == 0:
+                    progress_cb(1, count)
+            conn.execute(
+                "UPDATE series SET max_episode_no=coalesce((SELECT MAX(episode_no)"
+                " FROM episodes WHERE series_id=?),0) WHERE id=?",
+                (series["id"], series["id"]))
+    finally:
+        conn.close()
+    return count
+
+
+def _refresh_tapas_series(series, progress_cb=None):
+    """Re-read a Tapas series' episode list."""
+    series_id = series["source_ref"] or ""
+    if not series_id:
+        raise RuntimeError("Tapas series has no stored id; re-add it from its URL.")
+    episodes = sources.tapas_episodes(series_id)
+    if progress_cb:
+        progress_cb(1, len(episodes))
+    conn = db.connect()
+    try:
+        with conn:
+            for ep in episodes:
+                readable = ep["free"] or ep["unlocked"]
+                conn.execute(
+                    "INSERT INTO episodes (series_id, episode_no, title, url, known, status,"
+                    " error) VALUES (?,?,?,?,1,?,?) ON CONFLICT(series_id, episode_no)"
+                    " DO UPDATE SET known=1, title=excluded.title, url=excluded.url",
+                    (series["id"], ep["episode_no"],
+                     ep["title"] or f"Episode {ep['episode_no']}", ep["id"],
+                     "unknown" if readable else "locked",
+                     "" if readable else "paid or early-access episode"))
+            conn.execute(
+                "UPDATE series SET last_checked=?, max_episode_no=coalesce("
+                "(SELECT MAX(episode_no) FROM episodes WHERE series_id=?),0) WHERE id=?",
+                (db.now(), series["id"], series["id"]))
+    finally:
+        conn.close()
+    return len(episodes)
+
+
 def do_refresh(job_id, series_id):
     """Background crawl of the full web episode list."""
     _update_job(job_id, total=0, message="Fetching episode list…")
 
     def progress(page, found):
+        _check_cancel(job_id)
         _update_job(job_id, message=f"Page {page} · {found} episodes found")
 
     count = refresh_series_episodes(series_id, progress_cb=progress)
@@ -175,17 +474,22 @@ def do_check_range(job_id, series_id, start, end):
     conn.close()
     _update_job(job_id, total=len(rows))
     delay = _delay_ge_zero("check_delay")
+    failed = 0
     for i, ep in enumerate(rows):
+        _check_cancel(job_id)
         status = webtoon.check_episode(ep["url"], cookie)
+        if status == "unavailable":
+            failed += 1
         mapped = {"available": "available", "unavailable": "unknown"}.get(status, "unknown")
         conn = db.connect()
         with conn:
             conn.execute("UPDATE episodes SET status=?, error='' WHERE id=?",
                          (mapped, ep["id"]))
         conn.close()
-        _update_job(job_id, done=i + 1, message=f"Ep {ep['episode_no']}: {status}")
+        _update_job(job_id, done=i + 1, failed=failed,
+                    message=f"Ep {ep['episode_no']}: {status}")
         if i + 1 < len(rows):
-            time.sleep(delay)
+            _sleep_or_cancel(job_id, delay)
 
 
 def _series_known_count(conn, series_id):
@@ -200,6 +504,91 @@ def _series_looks_sparse(conn, series_id, max_no):
         return False
     have = _series_known_count(conn, series_id)
     return have < max_no * 0.6
+
+
+def _download_chapter_images(job_id, series, ep, series_title_no, cookie=None):
+    """Fetch one MangaDex chapter's pages. Returns (saved_paths, status)."""
+    scan = (_setting_bool("scan_downloads"))
+    scan_av = (_setting_bool("scan_antivirus"))
+    delay = _delay_ge_zero("img_delay")
+    try:
+        urls, _digest = sources.mangadex_pages(ep["url"])
+    except Exception as e:
+        return [], f"error: {e}"
+    if not urls:
+        return [], "unavailable"
+    ep_dir = db.episode_dir(series_title_no, ep["episode_no"])
+    os.makedirs(ep_dir, exist_ok=True)
+    saved = []
+    for n, url in enumerate(urls, 1):
+        _check_cancel(job_id)
+        ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1] or ".jpg"
+        path = os.path.join(ep_dir, f"{n - 1:03d}{ext}")
+
+        def fetch(u):
+            return net.get(u, session=None, timeout=60,
+                           headers={"User-Agent": "NetScrollOffline/1.0"})
+
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            saved.append(path)
+        elif scan or scan_av:
+            ok, reason = scanner.download_to(url, path, fetch, scan=scan_av)
+            if not ok:
+                return saved, f"corrupt: {reason}"
+            saved.append(path)
+        else:
+            data = fetch(url).content
+            with open(path + ".part", "wb") as f:
+                f.write(data)
+            os.replace(path + ".part", path)
+            saved.append(path)
+        if len(urls) > 1 and delay > 0 and n < len(urls):
+            time.sleep(delay)
+    return saved, "downloaded"
+
+
+def _download_tapas_episode(job_id, series, ep, series_title_no):
+    """Fetch one Tapas episode's pages. Returns (saved_paths, status)."""
+    scan = _setting_bool("scan_downloads")
+    scan_av = _setting_bool("scan_antivirus")
+    delay = _delay_ge_zero("img_delay")
+    try:
+        urls = sources.tapas_pages(ep["url"])
+    except Exception as e:
+        msg = str(e)
+        if "locked" in msg.lower():
+            return [], "locked"
+        return [], f"error: {msg}"
+    if not urls:
+        return [], "unavailable"
+    ep_dir = db.episode_dir(series_title_no, ep["episode_no"])
+    os.makedirs(ep_dir, exist_ok=True)
+    saved = []
+    for n, url in enumerate(urls, 1):
+        _check_cancel(job_id)
+        ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1] or ".jpg"
+        path = os.path.join(ep_dir, f"{n - 1:03d}{ext}")
+
+        def fetch(u):
+            return net.get(u, timeout=60, referer=f"https://tapas.io/episode/{ep['url']}",
+                           headers={"User-Agent": sources.MANGADEX_UA})
+
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            saved.append(path)
+        elif scan or scan_av:
+            ok, reason = scanner.download_to(url, path, fetch, scan=scan_av)
+            if not ok:
+                return saved, f"corrupt: {reason}"
+            saved.append(path)
+        else:
+            data = fetch(url).content
+            with open(path + ".part", "wb") as f:
+                f.write(data)
+            os.replace(path + ".part", path)
+            saved.append(path)
+        if n < len(urls) and delay > 0:
+            time.sleep(delay)
+    return saved, "downloaded"
 
 
 def do_download(job_id, series_id, start, end, full=False):
@@ -235,18 +624,28 @@ def do_download(job_id, series_id, start, end, full=False):
     conn.close()
     _update_job(job_id, total=len(rows))
     msgs = []
+    failed = 0
     for i, ep in enumerate(rows):
+        _check_cancel(job_id)
         try:
-            saved, status = webtoon.download_episode(series, ep, cookie)
+            if (series["source"] or "webtoon") == "mangadex":
+                saved, status = _download_chapter_images(
+                    job_id, series, ep, series["title_no"], cookie)
+            elif (series["source"] or "webtoon") == "tapas":
+                saved, status = _download_tapas_episode(
+                    job_id, series, ep, series["title_no"])
+            else:
+                saved, status = webtoon.download_episode(series, ep, cookie)
         except RequestException as e:
             status, saved = "error", []
+            failed += 1
             conn = db.connect()
             with conn:
                 conn.execute("UPDATE episodes SET status='error', error=? WHERE id=?",
                              (str(e)[:300], ep["id"]))
             conn.close()
             msgs.append(f"Ep {ep['episode_no']}: ERROR {str(e)[:120]}")
-            _update_job(job_id, done=i + 1, message=msgs[-1])
+            _update_job(job_id, done=i + 1, failed=failed, message=msgs[-1])
             continue
         conn = db.connect()
         with conn:
@@ -256,19 +655,29 @@ def do_download(job_id, series_id, start, end, full=False):
             elif status == "unavailable":
                 conn.execute("UPDATE episodes SET status='unknown', error=? WHERE id=?",
                              ("web viewer answered an error (often app-only titles)", ep["id"]))
+            elif status.startswith("corrupt") or status.startswith("error"):
+                # A failed integrity check is a real failure: mark it so the
+                # job's retry logic and the queue UI both surface it.
+                conn.execute("UPDATE episodes SET status='error', error=? WHERE id=?",
+                             (status[:300], ep["id"]))
+                failed += 1
             else:
                 conn.execute(
                     "UPDATE episodes SET status=?, image_count=?, downloaded_at=?, error=''"
                     " WHERE id=?", (status, len(saved), db.now(), ep["id"]))
         conn.close()
+        if status == "unavailable":
+            failed += 1
         msgs.append(f"Ep {ep['episode_no']}: {status} ({len(saved)} pages)")
-        _update_job(job_id, done=i + 1, message=msgs[-1])
-        time.sleep(_delay_ge_zero("check_delay"))
+        _update_job(job_id, done=i + 1, failed=failed, message=msgs[-1])
+        _sleep_or_cancel(job_id, _delay_ge_zero("check_delay"))
     write_phoenix_records()
+    if failed:
+        _update_job(job_id, message=f"{failed} of {len(rows)} episode(s) failed")
 
 
 # ---------------------------------------------------------------- export
-EXPORTS_DIR = os.path.join(db.BASE_DIR, "exports")
+EXPORTS_DIR = os.path.join(db.DATA_BASE, "exports")
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 
 
@@ -332,9 +741,7 @@ def do_export(job_id, series_id=None, fmt="cbz"):
 
     _update_job(job_id, total=len(plan))
     if not plan:
-        _update_job(job_id, status="error",
-                    message="Nothing downloaded yet — run a download first.")
-        return
+        raise JobError("Nothing downloaded yet — run a download first.")
 
     os.makedirs(EXPORTS_DIR, exist_ok=True)
     # Prune archives from earlier exports (older than a day) so repeated
@@ -382,6 +789,7 @@ def do_export(job_id, series_id=None, fmt="cbz"):
 def _write_export_zip(out_path, token, plan, fmt, manifest, used_dirs, job_id):
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
         for i, (s, ep, imgs) in enumerate(plan):
+            _check_cancel(job_id)
             if s["id"] not in used_dirs:
                 name = _safe_name(s["title"], s["title_no"])
                 if name in used_dirs.values():
@@ -462,7 +870,9 @@ def library():
         LEFT JOIN progress p ON p.series_id=s.id AND p.profile_id=?
         ORDER BY s.title COLLATE NOCASE""", (profile["id"],)).fetchall()
     conn.close()
-    return render_template("library.html", series=series_rows)
+    return render_template("library.html", series=series_rows,
+                           locales=sources.WEBTOON_LOCALES,
+                           genres=sources.WEBTOON_GENRES)
 
 
 @app.post("/api/profile/switch")
@@ -492,11 +902,17 @@ def api_profile_create():
 def api_series_add():
     url = (request.form.get("url") or "").strip()
     try:
-        parts = webtoon.parse_series_url(url)
+        target = sources.detect(url)
     except ValueError as e:
         return render_template("error.html", message=str(e)), 400
+    if target["source"] == "mangadex":
+        return _add_mangadex_series(target["manga_id"])
+    if target["source"] == "tapas":
+        return _add_tapas_series(target["parts"]["slug"])
+    parts = target["parts"]
     conn = db.connect()
-    dup = conn.execute("SELECT id FROM series WHERE title_no=?", (parts["title_no"],)).fetchone()
+    dup = conn.execute("SELECT id FROM series WHERE title_no=? AND source='webtoon'",
+                       (parts["title_no"],)).fetchone()
     conn.close()
     if dup:
         return redirect(url_for("series_page", series_id=dup["id"]))
@@ -513,13 +929,13 @@ def api_series_add():
     with conn:
         cur = conn.execute(
             "INSERT INTO series (title_no, language, genre, slug, title, authors, description,"
-            " cover, cover_kind, series_status, max_episode_no, last_checked)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " cover, cover_kind, series_status, max_episode_no, last_checked, source, source_ref)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (parts["title_no"], parts["lang"], parts["genre"], parts["slug"],
              meta["title"] if meta else "Untitled (needs refresh)",
              meta["authors"] if meta else "", meta["description"] if meta else "",
              meta["cover"] if meta else "", meta["cover_kind"] if meta else "thumb",
-             meta["status"] if meta else "", 0, db.now()))
+             meta["status"] if meta else "", 0, db.now(), "webtoon", parts["title_no"]))
         series_id = cur.lastrowid
         if meta:
             for ep in meta["episodes"]:
@@ -530,6 +946,114 @@ def api_series_add():
                 conn.execute("UPDATE series SET max_episode_no=max(max_episode_no,?) WHERE id=?",
                              (ep["episode_no"], series_id))
     conn.close()
+    return redirect(url_for("series_page", series_id=series_id))
+
+
+def _add_mangadex_series(manga_id):
+    """Import a MangaDex title and its English chapter list."""
+    try:
+        r = sources._mdx_get(f"{sources.MANGADEX_API}/manga/{manga_id}"
+                             "?includes[]=cover_art&includes[]=author")
+        data = (r.json() or {}).get("data") or {}
+    except Exception as e:
+        return render_template("error.html", message=f"MangaDex lookup failed: {e}"), 502
+    attrs = data.get("attributes") or {}
+    title_map = attrs.get("title") or {}
+    title = title_map.get("en") or next(iter(title_map.values()), "") or "Untitled"
+    authors = ", ".join((rel.get("attributes") or {}).get("name", "")
+                        for rel in data.get("relationships") or []
+                        if rel.get("type") == "author")
+    desc = ((attrs.get("description") or {}).get("en") or "")[:4000]
+    cover = ""
+    for rel in data.get("relationships") or []:
+        if rel.get("type") == "cover_art":
+            fn = (rel.get("attributes") or {}).get("fileName")
+            if fn:
+                cover = f"https://uploads.mangadex.org/covers/{manga_id}/{fn}.512.jpg"
+
+    conn = db.connect()
+    dup = conn.execute("SELECT id FROM series WHERE source='mangadex' AND source_ref=?",
+                       (manga_id,)).fetchone()
+    conn.close()
+    if dup:
+        return redirect(url_for("series_page", series_id=dup["id"]))
+
+    try:
+        chapters = sources.mangadex_chapters(manga_id, language="en")
+    except Exception as e:
+        return render_template("error.html",
+                               message=f"MangaDex chapter list failed: {e}"), 502
+
+    conn = db.connect()
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO series (title_no, language, genre, slug, title, authors, description,"
+            " cover, cover_kind, series_status, max_episode_no, last_checked, source, source_ref)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"md_{manga_id}", "en", "", manga_id, title, authors, desc,
+             cover, "banner", (attrs.get("status") or "").upper(), 0, db.now(),
+             "mangadex", manga_id))
+        series_id = cur.lastrowid
+        for ch in chapters:
+            conn.execute(
+                "INSERT INTO episodes (series_id, episode_no, title, url, known, status)"
+                " VALUES (?,?,?,?,1,'unknown') ON CONFLICT(series_id, episode_no)"
+                " DO UPDATE SET known=1, title=excluded.title, url=excluded.url",
+                (series_id, ch["episode_no"],
+                 ch["title"] or f"Chapter {ch['episode_no']}", ch["id"]))
+        conn.execute("UPDATE series SET max_episode_no=coalesce((SELECT MAX(episode_no)"
+                     " FROM episodes WHERE series_id=?),0) WHERE id=?", (series_id, series_id))
+    conn.close()
+    return redirect(url_for("series_page", series_id=series_id))
+
+
+def _add_tapas_series(slug):
+    """Import a Tapas series and its episode list."""
+    try:
+        info = sources.tapas_resolve(f"https://tapas.io/series/{slug}")
+        episodes = sources.tapas_episodes(info["series_id"])
+    except Exception as e:
+        return render_template("error.html", message=f"Tapas lookup failed: {e}"), 502
+    if not episodes:
+        return render_template("error.html",
+                               message="That Tapas series has no readable episodes."), 404
+
+    conn = db.connect()
+    dup = conn.execute("SELECT id FROM series WHERE source='tapas' AND source_ref=?",
+                       (info["series_id"],)).fetchone()
+    conn.close()
+    if dup:
+        return redirect(url_for("series_page", series_id=dup["id"]))
+
+    conn = db.connect()
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO series (title_no, language, genre, slug, title, authors,"
+                " description, cover, cover_kind, series_status, max_episode_no,"
+                " last_checked, source, source_ref)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"tapas_{info['series_id']}", "en", "", info["slug"], info["title"],
+                 "", info["description"], info["cover"], "banner", "", 0, db.now(),
+                 "tapas", info["series_id"]))
+            series_id = cur.lastrowid
+            for ep in episodes:
+                # Episodes the session cannot read are stored as locked so the
+                # UI is honest instead of retrying them as network failures.
+                readable = ep["free"] or ep["unlocked"]
+                status = "unknown" if readable else "locked"
+                err = "" if readable else "paid or early-access episode"
+                conn.execute(
+                    "INSERT INTO episodes (series_id, episode_no, title, url, known, status,"
+                    " error) VALUES (?,?,?,?,1,?,?) ON CONFLICT(series_id, episode_no)"
+                    " DO UPDATE SET known=1, title=excluded.title, url=excluded.url",
+                    (series_id, ep["episode_no"], ep["title"] or
+                     f"Episode {ep['episode_no']}", ep["id"], status, err))
+            conn.execute("UPDATE series SET max_episode_no=coalesce((SELECT MAX(episode_no)"
+                         " FROM episodes WHERE series_id=?),0) WHERE id=?",
+                         (series_id, series_id))
+    finally:
+        conn.close()
     return redirect(url_for("series_page", series_id=series_id))
 
 
@@ -560,8 +1084,9 @@ def api_series_refresh(series_id):
     conn.close()
     if not series:
         return jsonify(error="Series not found."), 404
-    job_id = _new_job("Refreshing episode list")
-    JOB_QUEUE.put((job_id, lambda: do_refresh(job_id, series_id)))
+    job_id = _new_job(f"Refresh episodes — {_series_label(series_id)}",
+                      kind="refresh", series_id=series_id, max_attempts=2,
+                      fn=lambda: do_refresh(job_id, series_id))
     return jsonify(ok=True, job=job_id)
 
 
@@ -626,8 +1151,9 @@ def api_series_check(series_id):
     conn.close()
     if not end:
         end = row["max_episode_no"] if row else start
-    job_id = _new_job(f"check ser{series_id} {start}-{end}")
-    JOB_QUEUE.put((job_id, lambda: do_check_range(job_id, series_id, start, end)))
+    job_id = _new_job(f"Check {_series_label(series_id)} · episodes {start}-{end}",
+                      kind="check", series_id=series_id,
+                      fn=lambda: do_check_range(job_id, series_id, start, end))
     return jsonify(ok=True, job=job_id)
 
 
@@ -656,16 +1182,66 @@ def api_download():
     start = int(request.form.get("start", 1) or 1)
     end = int(request.form.get("end", 0) or 0)
     full = request.form.get("full") in ("1", "true", "on")
+    res = _queue_series_download(sid, start=start, end=end, full=full)
+    if not res.get("ok"):
+        return jsonify(error=res.get("error") or "Unknown series."), 404
+    return jsonify(ok=True, job=res["job"], skipped=res.get("skipped", ""))
+
+
+def _queue_series_download(series_id, start=1, end=0, full=True):
+    """Queue one whole-series download, skipping series that are already in line.
+
+    Shared by the single-series button and the library's bulk queue so both
+    behave identically, including deduplication of duplicate requests.
+    """
     conn = db.connect()
-    row = conn.execute("SELECT max_episode_no FROM series WHERE id=?", (sid,)).fetchone()
+    row = conn.execute("SELECT max_episode_no FROM series WHERE id=?",
+                       (series_id,)).fetchone()
     conn.close()
     if not row:
-        return jsonify(error="Unknown series."), 404
+        return {"series_id": series_id, "ok": False, "error": "Unknown series."}
     if not end:
         end = row["max_episode_no"]
-    job_id = _new_job(f"download ser{sid} {start}-{end}")
-    JOB_QUEUE.put((job_id, lambda: do_download(job_id, sid, start, end, full=full)))
-    return jsonify(ok=True, job=job_id)
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if (full and job["kind"] == "download" and job["series_id"] == series_id
+                    and job["status"] in ("queued", "running")
+                    and job["params"].get("full")):
+                return {"series_id": series_id, "ok": True, "job": job["id"],
+                        "skipped": "already queued"}
+    job_id = _new_job(
+        (f"Download all episodes — {_series_label(series_id)}" if full
+         else f"Download {_series_label(series_id)} · episodes {start}-{end}"),
+        kind="download", series_id=series_id,
+        params={"start": start, "end": end, "full": full},
+        fn=lambda: do_download(job_id, series_id, start, end, full=full))
+    return {"series_id": series_id, "ok": True, "job": job_id}
+
+
+@app.post("/api/queue/bulk")
+def api_queue_bulk():
+    """Queue whole-series downloads for many series at once (library selection)."""
+    raw = request.form.get("series_ids") or ""
+    if not raw and request.is_json:
+        ids = (request.json or {}).get("series_ids") or []
+        raw = ",".join(str(i) for i in ids)
+    wanted = []
+    for part in str(raw).replace(" ", ",").split(","):
+        part = part.strip()
+        if not part.isdigit():
+            continue
+        sid = int(part)
+        if sid not in wanted:
+            wanted.append(sid)
+    if not wanted:
+        return jsonify(error="Pick at least one series."), 400
+    if len(wanted) > 200:
+        return jsonify(error="Too many series in one request (max 200)."), 400
+    results = [_queue_series_download(sid) for sid in wanted]
+    ok = sum(1 for r in results if r.get("ok"))
+    skipped = sum(1 for r in results if r.get("skipped"))
+    return jsonify(ok=True, queued=ok - skipped, skipped=skipped,
+                   failed=len(results) - ok, results=results)
 
 
 @app.post("/api/export")
@@ -684,9 +1260,10 @@ def api_export():
         conn.close()
         if not ok:
             return jsonify(error="Unknown series."), 404
-    desc = f"export {'ser' + str(sid) if sid else 'library'} {fmt}"
-    job_id = _new_job(desc)
-    JOB_QUEUE.put((job_id, lambda: do_export(job_id, sid, fmt)))
+    desc = (f"Export {_series_label(sid)} as {fmt.upper()}" if sid
+            else f"Export whole library as {fmt.upper()}")
+    job_id = _new_job(desc, kind="export", series_id=sid, params={"fmt": fmt},
+                      fn=lambda: do_export(job_id, sid, fmt))
     return jsonify(ok=True, job=job_id)
 
 
@@ -714,6 +1291,285 @@ def api_export_download(token):
 @app.get("/api/job/<job_id>")
 def api_job(job_id):
     return jsonify(_job_status(job_id) or {})
+
+
+# ---------------------------------------------------------------- queue routes
+
+@app.route("/queue")
+def queue_page():
+    _load_queue_settings()
+    return render_template("queue.html")
+
+
+@app.get("/api/queue")
+def api_queue():
+    _load_queue_settings()
+    snap = _queue_snapshot()
+    snap["host_limits"] = net.stats()
+    return jsonify(snap)
+
+
+@app.get("/api/limits")
+def api_limits():
+    """Current per-host request budget, and the configured pacing delays."""
+    return jsonify(hosts=net.stats(),
+                   check_delay=_delay_ge_zero("check_delay"),
+                   img_delay=_delay_ge_zero("img_delay"),
+                   scanning={"structure": _setting_bool("scan_downloads"),
+                             "antivirus": _setting_bool("scan_antivirus"),
+                             "antivirus_available": scanner.antivirus_available()})
+
+
+@app.post("/api/limits/host")
+def api_limit_set_host():
+    """Override one host's request budget (advanced; persisted in memory only)."""
+    host = (request.form.get("host") or "").strip()
+    if host not in net.HOST_LIMITS:
+        return jsonify(error="Unknown host."), 404
+    try:
+        rps = float(request.form.get("rps") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="rps must be a number."), 400
+    if rps <= 0:
+        return jsonify(error="rps must be greater than zero."), 400
+    burst = request.form.get("burst")
+    inflight = request.form.get("inflight")
+    net.set_host_limit(host, rps,
+                       int(burst) if burst and burst.isdigit() else None,
+                       int(inflight) if inflight and inflight.isdigit() else None)
+    return jsonify(ok=True, hosts=net.stats())
+
+
+@app.get("/api/sources")
+def api_sources():
+    """Which sources are available and which locales can be added."""
+    return jsonify(
+        sources=[{"id": "webtoon", "label": "WEBTOON",
+                  "notes": "webtoons.com web reader, including other language editions"},
+                 {"id": "mangadex", "label": "MangaDex",
+                  "notes": "official JSON API; English scanlations and non-WEBTOON titles"},
+                 {"id": "tapas", "label": "Tapas",
+                  "notes": "tapas.io web reader; robots.txt allows /series/ and /episode/"}],
+        webtoon_locales=sources.WEBTOON_LOCALES,
+        antivirus=scanner.antivirus_available(),
+    )
+
+
+@app.post("/api/sources/alternates")
+def api_source_alternates():
+    """List other WEBTOON locale editions for a pasted series URL."""
+    url = (request.form.get("url") or "").strip()
+    try:
+        parts = webtoon.parse_series_url(url)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(alternates=sources.webtoon_alternates(parts, cookie=get_cookie()),
+                   current=parts["lang"])
+
+
+@app.get("/api/sources/catalog")
+def api_source_catalog():
+    """Browse one WEBTOON language edition's genre catalogue."""
+    lang = (request.args.get("language") or "en").strip()
+    genre = (request.args.get("genre") or "romance").strip()
+    try:
+        pages = max(1, min(10, int(request.args.get("pages") or 1)))
+    except ValueError:
+        pages = 1
+    if lang not in sources.WEBTOON_LOCALES:
+        return jsonify(error="Unknown language edition."), 400
+    if genre not in sources.WEBTOON_GENRES:
+        return jsonify(error="Unknown genre."), 400
+    try:
+        titles = sources.webtoon_catalog(lang, genre, pages=pages, cookie=get_cookie())
+    except Exception as e:
+        return jsonify(error=f"Could not browse that catalogue: {e}"), 502
+    return jsonify(language=lang, genre=genre, titles=titles)
+
+
+@app.post("/api/sources/add")
+def api_source_add_by_id():
+    """Add a series from a bare WEBTOON title_no (any locale edition)."""
+    title_no = (request.form.get("title_no") or "").strip()
+    if not title_no.isdigit():
+        return jsonify(error="A numeric title_no is required."), 400
+    try:
+        parts = webtoon.resolve_title_noURL(title_no)
+    except Exception as e:
+        return jsonify(error=f"Could not resolve title_no {title_no}: {e}"), 502
+    url = (f"https://www.webtoons.com/{parts['language']}/{parts['genre']}/"
+           f"{parts['slug']}/list?title_no={title_no}")
+    return jsonify(ok=True, url=url, language=parts["language"])
+
+
+@app.post("/api/sources/mangadex/search")
+def api_mangadex_search():
+    term = (request.form.get("q") or "").strip()
+    if len(term) < 2:
+        return jsonify(error="Type at least two characters."), 400
+    try:
+        found = sources.mangadex_search(term, limit=8)
+    except Exception as e:
+        return jsonify(error=f"MangaDex search failed: {e}"), 502
+    return jsonify(results=found)
+
+
+@app.post("/api/queue/slots")
+def api_queue_slots():
+    raw = request.form.get("slots")
+    if raw is None and request.is_json:
+        raw = (request.json or {}).get("slots")
+    try:
+        slots = int(raw or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="Slots must be a number."), 400
+    if slots < 1:
+        return jsonify(error="Slots must be a number."), 400
+    slots = max(1, min(8, slots))
+    with JOBS_LOCK:
+        QUEUE["slots"] = slots
+        DISPATCH.notify_all()
+        _save_queue_settings()
+    return jsonify(ok=True, slots=slots)
+
+
+@app.post("/api/queue/pause")
+def api_queue_pause():
+    with JOBS_LOCK:
+        QUEUE["paused"] = True
+    return jsonify(ok=True, paused=True)
+
+
+@app.post("/api/queue/resume")
+def api_queue_resume():
+    with JOBS_LOCK:
+        QUEUE["paused"] = False
+        DISPATCH.notify_all()
+    return jsonify(ok=True, paused=False)
+
+
+def _retry_job(job_id, reset_attempts=True):
+    """Put a finished/failed job back in the queue and return its record."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return None
+        if job["status"] == "running":
+            return job
+        job["cancel"] = False
+        job["status"] = "queued"
+        job["retry_at"] = 0.0
+        job["finished_at"] = None
+        job["error"] = ""
+        job["failed"] = 0
+        job["done"] = 0
+        job["total"] = 0
+        job["message"] = "Queued (manual retry)"
+        if reset_attempts:
+            job["attempts"] = 0
+        DISPATCH.notify_all()
+        return dict(job)
+
+
+@app.post("/api/queue/retry/<job_id>")
+def api_queue_retry(job_id):
+    # "Retry now" on a job that is already waiting for its auto-retry keeps its
+    # attempt counter so it cannot loop forever.
+    waiting = (_job_status(job_id) or {}).get("status") == "queued"
+    job = _retry_job(job_id, reset_attempts=not waiting)
+    if job is None:
+        return jsonify(error="Unknown job."), 404
+    if job["status"] == "running":
+        return jsonify(error="Job is already running."), 409
+    return jsonify(ok=True)
+
+
+@app.post("/api/queue/cancel/<job_id>")
+def api_queue_cancel(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify(error="Unknown job."), 404
+        job["cancel"] = True
+        if job["status"] in ("queued", "retry"):
+            job["status"] = "cancelled"
+            job["finished_at"] = time.time()
+            job["message"] = "Cancelled before starting"
+        elif job["status"] == "running":
+            job["message"] = "Cancelling…"
+        DISPATCH.notify_all()
+    return jsonify(ok=True)
+
+
+@app.post("/api/queue/remove/<job_id>")
+def api_queue_remove(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify(error="Unknown job."), 404
+        if job["status"] == "running":
+            return jsonify(error="Cancel the job before removing it."), 409
+        JOBS.pop(job_id, None)
+    return jsonify(ok=True)
+
+
+@app.post("/api/queue/clear")
+def api_queue_clear():
+    """Remove every job that is not queued or running."""
+    with JOBS_LOCK:
+        for job_id in [k for k, j in JOBS.items()
+                       if j["status"] in ("done", "error", "cancelled")]:
+            JOBS.pop(job_id, None)
+    return jsonify(ok=True)
+
+
+@app.post("/api/queue/retry-failed")
+def api_queue_retry_failed():
+    with JOBS_LOCK:
+        ids = [k for k, j in JOBS.items() if j["status"] == "error"]
+    for job_id in ids:
+        _retry_job(job_id)
+    return jsonify(ok=True, retried=len(ids))
+
+
+@app.post("/api/queue/cancel-queued")
+def api_queue_cancel_queued():
+    with JOBS_LOCK:
+        n = 0
+        for job in JOBS.values():
+            if job["status"] == "queued":
+                job["cancel"] = True
+                job["status"] = "cancelled"
+                job["finished_at"] = time.time()
+                job["message"] = "Cancelled"
+                n += 1
+        DISPATCH.notify_all()
+    return jsonify(ok=True, cancelled=n)
+
+
+@app.post("/api/queue/auto-retry")
+def api_queue_auto_retry():
+    raw = (request.form.get("enabled") or "").lower()
+    enabled = raw in ("1", "true", "on", "yes")
+    attempts = request.form.get("max_attempts")
+    max_attempts = None
+    if attempts:
+        try:
+            max_attempts = max(1, min(20, int(attempts)))
+        except (TypeError, ValueError):
+            max_attempts = None
+    with JOBS_LOCK:
+        QUEUE["auto_retry"] = enabled
+        if max_attempts is not None:
+            QUEUE["max_attempts"] = max_attempts
+        for job in JOBS.values():
+            if job["status"] in ("queued", "running"):
+                job["auto_retry"] = enabled
+                if max_attempts is not None:
+                    job["max_attempts"] = max_attempts
+        _save_queue_settings()
+    return jsonify(ok=True, auto_retry=enabled,
+                   max_attempts=QUEUE["max_attempts"])
 
 
 @app.get("/api/ep/<int:series_id>/<int:ep_no>/images")
@@ -841,10 +1697,15 @@ def reader(series_id, ep_no):
 
 @app.route("/settings")
 def settings_page():
+    av = scanner.clamav_path()
     return render_template("settings.html",
                            cookie=get_cookie(),
                            check_delay=get_setting("check_delay", "1.0"),
-                           img_delay=get_setting("img_delay", "0.35"))
+                           img_delay=get_setting("img_delay", "0.35"),
+                           scan_downloads=_setting_bool("scan_downloads"),
+                           scan_antivirus=_setting_bool("scan_antivirus"),
+                           av_available=bool(av), av_path=av or "",
+                           host_limits=net.stats())
 
 
 @app.post("/api/settings")
@@ -856,6 +1717,8 @@ def api_settings_save():
         except ValueError:
             v = 0.0
         set_setting(key, str(v))
+    for key in ("scan_downloads", "scan_antivirus"):
+        set_setting(key, "1" if request.form.get(key) else "0")
     return redirect(url_for("settings_page"))
 
 
@@ -924,6 +1787,7 @@ def do_watchlist_scan(job_id, limit=999):
     conn.close()
     _update_job(job_id, total=len(rows))
     for i, row in enumerate(rows):
+        _check_cancel(job_id)
         names = [row["name"]]
         extra = re.split(r"\s*[/;]\s*", row["notes"] or "")
         extra = [e for e in extra if e and not e.lower().startswith("removed")] or ""
@@ -975,7 +1839,7 @@ def do_watchlist_scan(job_id, limit=999):
             conn.close()
             msg = f"{row['name']}: no confident match — needs a source hunt"
         _update_job(job_id, done=i + 1, message=msg)
-        time.sleep(0.4)
+        _sleep_or_cancel(job_id, 0.4)
     write_phoenix_records()
 
 
@@ -1029,8 +1893,8 @@ def api_watchlist_import():
 @app.post("/api/watchlist/scan")
 def api_watchlist_scan():
     limit = int(request.form.get("limit", 999) or 999)
-    job_id = _new_job("watchlist-scan")
-    JOB_QUEUE.put((job_id, lambda: do_watchlist_scan(job_id, limit)))
+    job_id = _new_job("watchlist-scan", kind="watchlist",
+                      fn=lambda: do_watchlist_scan(job_id, limit))
     return jsonify(ok=True, job=job_id)
 
 

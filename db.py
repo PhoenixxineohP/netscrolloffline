@@ -3,8 +3,11 @@ import os, sqlite3
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data", "netscroll.db")
-DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+# NSO_DATA_DIR lets the test suite (or a portable install) point the library
+# somewhere other than the project folder, so tests never touch real data.
+DATA_BASE = os.environ.get("NSO_DATA_DIR") or BASE_DIR
+DB_PATH = os.path.join(DATA_BASE, "data", "netscroll.db")
+DOWNLOADS_DIR = os.path.join(DATA_BASE, "downloads")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -76,11 +79,31 @@ CREATE TABLE IF NOT EXISTS watchlist (
 """
 
 
+# How long a connection waits for a competing writer before raising
+# "database is locked". Job threads all write progress, so this matters as soon
+# as the queue runs more than one slot.
+BUSY_TIMEOUT_MS = 15000
+
+
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_MS / 1000.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL lets readers and one writer proceed at the same time instead of
+    # serialising every job thread on a single write lock.
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+def setting(conn, key: str, default: str = "") -> str:
+    """Read one setting using an already-open connection."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
 
 
 def init_db() -> None:
@@ -93,7 +116,9 @@ def init_db() -> None:
         series_cols = {r["name"] for r in conn.execute("PRAGMA table_info(series)")}
         for col, ddl in (("kind", "TEXT DEFAULT 'webtoon'"),
                          ("genre_tags", "TEXT DEFAULT ''"),
-                         ("genre", "TEXT DEFAULT ''")):
+                         ("genre", "TEXT DEFAULT ''"),
+                         ("source", "TEXT DEFAULT 'webtoon'"),
+                         ("source_ref", "TEXT DEFAULT ''")):
             if col not in series_cols:
                 conn.execute(f"ALTER TABLE series ADD COLUMN {col} {ddl}")
         # Default profile + settings
@@ -108,6 +133,13 @@ def init_db() -> None:
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("img_delay", "0.35")
         )
+        for key, value in (
+            ("scan_downloads", "0"),      # verify image structure on every save
+            ("scan_antivirus", "0"),      # also run ClamAV when it is installed
+            ("source_prefer", "webtoon"), # default catalogue for new series
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
     conn.close()
 
 

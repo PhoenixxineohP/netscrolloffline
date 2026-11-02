@@ -4,12 +4,16 @@
    - 'nso-media'     : downloaded episode pages (persists across shell updates;
                        written both by the PC-archive fetches and by 📱 device saves)
 */
-const SHELL_CACHE = 'nso-shell-v2';
+const SHELL_CACHE = 'nso-shell-v4';
 const MEDIA_CACHE = 'nso-media';
 const SHELL = [
   '/',
   '/static/style.css',
   '/static/series.js',
+  '/static/queue.js',
+  '/static/queuebulk.js',
+  '/static/browse.js',
+  '/static/export.js',
   '/static/reader.js',
   '/static/nslib.js',
   '/static/manifest.webmanifest',

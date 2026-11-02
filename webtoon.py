@@ -1,18 +1,8 @@
-"""WEBTOON (webtoons.com) helpers for NetScrollOffline.
-
-Two sources of truth we rely on:
-  1) The web episode list page -> currently free/web-readable episodes.
-  2) The web viewer page -> data-url list of full-resolution page images,
-     which also exists for episodes your account can legitimately read
-     (that's why Settings lets you paste your webtoons.com session cookie).
-
-We deliberately do not touch Naver's private app APIs, third-party mirrors,
-or any unlock/paywall bypass. The downloader only saves pages that are
-actually readable in the web viewer.
-"""
 import os, re, time, requests, urllib.parse
 from bs4 import BeautifulSoup
 import db
+import net
+import scanner
 
 VIEWER_IMG_RE = re.compile(r'class="_images"[^>]*data-url="([^"]+)"')
 
@@ -38,24 +28,18 @@ def _headers(cookie: str = None, referer: str = None) -> dict:
     return h
 
 
-def _get(session: requests.Session, url: str, cookie: str = None) -> requests.Response:
-    """GET with one polite retry on transient errors."""
-    delay = float(db.connect().execute(
-        "SELECT value FROM settings WHERE key='check_delay'").fetchone()[0])
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = session.get(url, headers=_headers(cookie), timeout=30)
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(2 + attempt * 3)
-                continue
-            return r
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(2 + attempt * 3)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("unreachable")
+def _setting(key, default):
+    conn = db.connect()
+    try:
+        return db.setting(conn, key, default)
+    finally:
+        conn.close()
+
+
+def _get(session: requests.Session, url: str, cookie=None) -> requests.Response:
+    """GET through the shared per-host rate limiter (retries handled there)."""
+    return net.get(url, cookie=cookie, session=session, timeout=30,
+                   headers={"User-Agent": UA})
 
 
 def base_url(parts: dict) -> str:
@@ -66,9 +50,14 @@ def base_url(parts: dict) -> str:
 
 
 def parse_series_url(url: str) -> dict:
-    """Extract language/genre/slug/title_no from any list/viewer URL."""
+    """Extract language/genre/slug/title_no from any list/viewer URL.
+
+    The language group accepts regional editions such as ``pt-br`` and
+    ``zh-hant`` as well as plain two-letter codes like ``en``.
+    """
     q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    m = re.search(r"webtoons\.com/([a-z]{2})/([a-z0-9-]+)/([^/]+)/(?:list|[^/]*viewer)", url)
+    m = re.search(r"webtoons\.com/([a-z]{2}(?:-[a-z]+)?)/([a-z0-9-]+)/([^/]+)/"
+                  r"(?:list|.*?viewer)", url)
     if not m:
         raise ValueError(
             "Could not parse that URL. It should look like "
@@ -285,11 +274,12 @@ def estimate_series(parts: dict, cookie: str = None) -> dict:
 def download_episode(series, ep, cookie=None, progress_cb=None):
     """Download one episode. Returns (saved_paths, status).
 
-    status: 'downloaded' | 'locked' | 'unavailable'
+    status: 'downloaded' | 'locked' | 'unavailable' | 'corrupt'
     """
     s = requests.Session()
-    delay = float(db.connect().execute(
-        "SELECT value FROM settings WHERE key='img_delay'").fetchone()[0])
+    delay = float(_setting("img_delay", "0.35") or 0)
+    scan = (_setting("scan_downloads", "0") or "0").lower() in ("1", "true", "on", "yes")
+    scan_av = (_setting("scan_antivirus", "0") or "0").lower() in ("1", "true", "on", "yes")
     r = _get(s, ep["url"], cookie)
     if r.status_code == 200 and '<div class="viewer_img' not in r.text:
         return [], ("locked" if "Connect Error" not in r.text else "unavailable")
@@ -300,21 +290,35 @@ def download_episode(series, ep, cookie=None, progress_cb=None):
     ep_dir = db.episode_dir(series["title_no"], ep["episode_no"])
     os.makedirs(ep_dir, exist_ok=True)
     saved = []
-    for i, url in enumerate(urls):
-        path = os.path.join(ep_dir, f"{i:03d}{os.path.splitext(urlparse_path(url))[1]}")
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            saved.append(path)
-        else:
-            rr = s.get(url, headers=_headers(cookie, referer=ep["url"]), timeout=60)
-            rr.raise_for_status()
-            with open(path, "wb") as f:
-                f.write(rr.content)
-            saved.append(path)
-        if progress_cb:
-            progress_cb(i + 1, len(urls))
-        if i + 1 < len(urls):
-            time.sleep(delay)
+    try:
+        for i, url in enumerate(urls):
+            path = os.path.join(ep_dir, f"{i:03d}{os.path.splitext(urlparse_path(url))[1]}")
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                saved.append(path)
+            else:
+                def fetch(u, _s=s):
+                    return net.get(u, cookie=cookie, session=_s, timeout=60,
+                                   headers={"User-Agent": UA, "Referer": ep["url"]})
+
+                if scan or scan_av:
+                    ok, reason = scanner.download_to(url, path, fetch, scan=scan_av)
+                    if not ok:
+                        return saved, f"corrupt: {reason}"
+                else:
+                    resp = fetch(url)
+                    tmp = path + ".part"
+                    with open(tmp, "wb") as f:
+                        f.write(resp.content)
+                    os.replace(tmp, path)
+                saved.append(path)
+            if progress_cb:
+                progress_cb(i + 1, len(urls))
+            if i + 1 < len(urls) and delay > 0:
+                time.sleep(delay)
+    finally:
+        s.close()
     return saved, "downloaded"
+
 
 
 def urlparse_path(url: str) -> str:

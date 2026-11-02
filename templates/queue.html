@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Queue &amp; Slots — NetScrollOffline{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <h1>Download Queue</h1>
+    <p class="muted">Everything you start — downloads, refreshes, checks, exports and
+      watchlist scans — lines up here. Raise the slot count to run several series at
+      once; failed jobs retry themselves automatically until the attempt limit.</p>
+  </div>
+</section>
+
+<section class="jobbox qcontrols">
+  <div class="qrow">
+    <label class="slots">
+      <span>Parallel slots</span>
+      <input id="q-slots" type="range" min="1" max="8" step="1" value="2">
+      <output id="q-slots-out">2</output>
+    </label>
+    <button id="q-pause" type="button">⏸ Pause queue</button>
+    <button id="q-retry-failed" type="button">↻ Retry all failed</button>
+    <button id="q-cancel-queued" type="button">✕ Cancel queued</button>
+    <button id="q-clear" type="button" class="danger">Clear finished</button>
+  </div>
+  <div class="qrow">
+    <label class="inline-toggle">
+      <input id="q-auto-retry" type="checkbox" checked>
+      <span>Auto-retry failed jobs</span>
+    </label>
+    <label class="inline-toggle">
+      <span>Max attempts</span>
+      <input id="q-max-attempts" type="number" min="1" max="20" value="3">
+    </label>
+    <span class="muted" id="q-status"></span>
+  </div>
+</section>
+
+<section class="eplist" id="q-list">
+  <p class="muted" id="q-empty">The queue is empty. Start a download from any series page.</p>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/queue.js"></script>
+{% endblock %}

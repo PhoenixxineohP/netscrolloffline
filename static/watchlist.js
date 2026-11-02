@@ -36,6 +36,10 @@
       if (j.status === 'done' || j.status === 'idle') {
         clearInterval(pollTimer); pollTimer = null;
         location.reload();
+      } else if (j.status === 'error' || j.status === 'cancelled') {
+        clearInterval(pollTimer); pollTimer = null;
+        jobMsg.textContent = (j.error || j.message || 'Scan stopped.') +
+          ' — see the Queue page.';
       }
     }).catch(() => { clearInterval(pollTimer); pollTimer = null; });
   }
@@ -90,4 +94,3 @@
   // ---------- scan-run UI ----------
   launchScan(); // initial auto-scan on page load
 })();
-</script>

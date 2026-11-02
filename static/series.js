@@ -17,10 +17,24 @@ function poll() {
     jobCount.textContent = `${j.done}/${j.total} (${pct}%)`;
     jobBar.style.width = pct + '%';
     if (j.message) jobMsg.textContent = j.message;
-    if (j.status === 'done' || j.status === 'error') {
+    if (j.status === 'queued') {
+      jobCount.textContent = j.total ? `${j.done}/${j.total}` : 'queued';
+      jobMsg.textContent = j.message || 'Waiting in the queue — start it from the Queue page.';
+      return;
+    }
+    if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
       clearInterval(pollTimer); pollTimer = null; activeJob = null;
+      if (j.status === 'cancelled') {
+        alert('The job was cancelled.');
+        const btn = document.getElementById('btn-refresh');
+        if (btn) { btn.disabled = false; }
+        return;
+      }
       if (j.status === 'error') {
-        alert(j.message || 'The job failed.');
+        alert((j.error || j.message || 'The job failed.') +
+              (j.auto_retry && j.attempts < j.max_attempts
+                ? '\n\nIt will be retried automatically — see the Queue page.'
+                : '\n\nYou can retry it from the Queue page.'));
         const btn = document.getElementById('btn-refresh');
         if (btn) { btn.disabled = false; }
         return;
@@ -169,9 +183,12 @@ function pollExport() {
     jobCount.textContent = j.total ? `${j.done}/${j.total} (${pct}%)` : '';
     jobBar.style.width = pct + '%';
     if (j.message) jobMsg.textContent = j.message;
-    if (j.status === 'done' || j.status === 'error') {
+    if (j.status === 'queued') return;
+    if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
       clearInterval(exportTimer); exportTimer = null; exportJob = null;
-      if (j.status === 'done' && j.url) {
+      if (j.status === 'cancelled') {
+        jobMsg.textContent = 'Export cancelled.';
+      } else if (j.status === 'done' && j.url) {
         jobMsg.textContent = `${j.message}\nDownloading ${j.filename}…`;
         const a = document.createElement('a');
         a.href = j.url; a.download = j.filename || '';

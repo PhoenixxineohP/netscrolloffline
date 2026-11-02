@@ -16,6 +16,43 @@
     <h2>Politeness delays (seconds)</h2>
     <label>Between page/viewer requests <input type="number" name="check_delay" step="0.1" min="0" value="{{ check_delay }}"></label>
     <label>Between image downloads <input type="number" name="img_delay" step="0.05" min="0" value="{{ img_delay }}"></label>
+    <p class="muted">
+      These are extra spacing on top of a per-host request budget that all queue slots
+      share, so raising the slot count cannot exceed the site's tolerance on its own.
+      Use <code>python limittest.py</code> to measure what your connection actually gets.
+    </p>
+
+    <h2>Download safety</h2>
+    <label class="inline-toggle">
+      <input type="checkbox" name="scan_downloads" {% if scan_downloads %}checked{% endif %}>
+      <span>Verify every saved page is a real image (recommended)</span>
+    </label>
+    <label class="inline-toggle">
+      <input type="checkbox" name="scan_antivirus" {% if scan_antivirus %}checked{% endif %}>
+      <span>Also run an antivirus scan on each page</span>
+    </label>
+    <p class="muted">
+      {% if av_available %}
+      ClamAV found at <code>{{ av_path }}</code>. With the box above ticked, each page is
+      scanned before it is kept.
+      {% else %}
+      No ClamAV (<code>clamscan</code>/<code>clamdscan</code>) found on this machine, so
+      antivirus scanning is unavailable. The structural check above still runs and
+      rejects HTML error pages saved under an image name.
+      {% endif %}
+    </p>
+
+    <h2>Sources</h2>
+    <p class="muted">
+      Add series from <b>WEBTOON</b> (any language edition, e.g. <code>/es/</code>,
+      <code>/fr/</code>, <code>/de/</code>, <code>/th/</code>, <code>/id/</code>,
+      <code>/zh-hant/</code>, <code>/pt-br/</code>), from <b>MangaDex</b> with a
+      <code>mangadex.org/title/&lt;uuid&gt;</code> link, or from <b>Tapas</b> with a
+      <code>tapas.io/series/&lt;name&gt;</code> link. MangaDex is used through its official
+      public API, which documents a 5&nbsp;req/s global limit and 40&nbsp;req/min for page
+      resolution; Tapas' robots.txt allows <code>/series/</code> and <code>/episode/</code>
+      crawling. The app stays under every documented limit.
+    </p>
 
     <button class="primary" type="submit">Save settings</button>
   </form>

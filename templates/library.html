@@ -6,9 +6,35 @@
     <p class="muted">Episodes saved to <b>Phoenix Records</b> (the PC archive) are permanent — devices just borrow copies.</p>
   </div>
   <form method="post" action="{{ url_for('api_series_add') }}" class="addrow">
-    <input type="text" name="url" placeholder="Paste a series URL, e.g. https://www.webtoons.com/en/…/list?title_no=5034" required>
+    <input type="text" name="url" placeholder="Paste a series URL — webtoons.com (any language), mangadex.org/title/<uuid>, or tapas.io/series/<name>" required>
     <button type="submit">Add series</button>
   </form>
+</section>
+
+<section class="jobbox" id="browsebox">
+  <div class="jobline">
+    <b>Browse other catalogues</b>
+    <span class="muted">Titles that only exist in another WEBTOON language edition</span>
+  </div>
+  <div class="actions" style="margin:0 0 10px">
+    <label>Edition
+      <select id="br-lang">
+        {% for code, name in locales.items() %}
+        <option value="{{ code }}">{{ name }} ({{ code }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Genre
+      <select id="br-genre">
+        {% for g in genres %}
+        <option value="{{ g }}">{{ g.replace('-', ' ') }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="button" id="br-go" class="primary">Browse</button>
+    <span class="muted" id="br-status"></span>
+  </div>
+  <div id="br-results" class="br-results"></div>
 </section>
 
 {% if series %}
@@ -30,28 +56,40 @@
   <div class="jobmsg exp-msg"></div>
 </section>
 
+<div class="queuetools" id="queuetools">
+  <label class="pick-all"><input type="checkbox" id="qpick-all"> Select all</label>
+  <span class="muted" id="qpick-count">Nothing selected</span>
+  <button type="button" id="qpick-queue" class="primary" disabled>⧉ Queue selected</button>
+  <span class="muted" id="qpick-status"></span>
+</div>
+
 <div class="grid">
   {% for s in series %}
-  <a class="card" href="{{ url_for('series_page', series_id=s['id']) }}">
-    <div class="cover">
-      {% if s['cover'] %}
-      <img src="{{ s['cover'] }}" alt="" loading="lazy">
-      {% else %}
-      <div class="cover-fallback">{{ s['title'][:1] }}</div>
+  <div class="cardwrap" data-series-id="{{ s['id'] }}">
+    <label class="pick" title="Select {{ s['title'] }} for the download queue">
+      <input type="checkbox" class="qpick" value="{{ s['id'] }}">
+    </label>
+    <a class="card" href="{{ url_for('series_page', series_id=s['id']) }}">
+      <div class="cover">
+        {% if s['cover'] %}
+        <img src="{{ s['cover'] }}" alt="" loading="lazy">
+        {% else %}
+        <div class="cover-fallback">{{ s['title'][:1] }}</div>
+        {% endif %}
+        {% if s['series_status'] %}<span class="badge">{{ s['series_status'] }}</span>{% endif %}
+      </div>
+      <h3>{{ s['title'] }}</h3>
+      <p class="muted">{{ s['authors'] or 'Unknown author' }}</p>
+      <p class="stats">
+        <span class="ok">{{ s['downloaded_count'] }} in Phoenix Records</span> ·
+        <span>{{ s['known_count'] }} known</span>
+        {% if s['locked_count'] %}· <span class="warn">{{ s['locked_count'] }} locked</span>{% endif %}
+      </p>
+      {% if s['last_ep'] %}
+      <p class="resume">Resume Ep {{ s['last_ep'] }} →</p>
       {% endif %}
-      {% if s['series_status'] %}<span class="badge">{{ s['series_status'] }}</span>{% endif %}
-    </div>
-    <h3>{{ s['title'] }}</h3>
-    <p class="muted">{{ s['authors'] or 'Unknown author' }}</p>
-    <p class="stats">
-      <span class="ok">{{ s['downloaded_count'] }} in Phoenix Records</span> ·
-      <span>{{ s['known_count'] }} known</span>
-      {% if s['locked_count'] %}· <span class="warn">{{ s['locked_count'] }} locked</span>{% endif %}
-    </p>
-    {% if s['last_ep'] %}
-    <p class="resume">Resume Ep {{ s['last_ep'] }} →</p>
-    {% endif %}
-  </a>
+    </a>
+  </div>
   {% endfor %}
 </div>
 {% else %}
@@ -64,4 +102,6 @@
 {% endblock %}
 {% block scripts %}
 <script src="{{ url_for('static', filename='export.js') }}"></script>
+<script src="{{ url_for('static', filename='queuebulk.js') }}"></script>
+<script src="{{ url_for('static', filename='browse.js') }}"></script>
 {% endblock %}

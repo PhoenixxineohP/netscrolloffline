@@ -78,6 +78,116 @@ is never affected by any device.
 - Some titles are fully app-only; the web viewer answers "Connect Error" for those, and
   the app will honestly mark them as not readable. Nothing smuggled, just accurate status.
 
+## Sources
+
+You can add series from more than the English WEBTOON catalogue.
+
+- **WEBTOON, every language edition.** Paste a URL from any edition:
+  `/en/`, `/es/`, `/fr/`, `/de/`, `/th/`, `/id/`, `/zh-hant/`, `/pt-br/`.
+  These are genuinely separate catalogues, not translations of one list: a title
+  that is Daily Pass or app-only in English may be free elsewhere, and many
+  titles exist only in one edition. The **Browse other catalogues** panel on the
+  Library page lists a chosen edition + genre and adds a title with one click.
+- **MangaDex.** Paste a `https://mangadex.org/title/<uuid>` link. Chapters come
+  from MangaDex's official public API and page images from its `@Home` network.
+  This covers English scanlations of the same series plus titles WEBTOON does
+  not host. No account or API key is needed for public chapters.
+- **Tapas.** Paste a `https://tapas.io/series/<name>` link. Its `robots.txt`
+  explicitly allows `/series/` and `/episode/` for all agents (only `/search`,
+  `/rss/`, `/mature` and account pages are disallowed, and none are requested).
+  Episodes are listed through the same JSON endpoint the site uses; paid or
+  early-access episodes are stored as **locked** rather than retried as errors.
+- **What is deliberately excluded:** mirror/aggregator sites that redistribute
+  paid content without permission, and reverse-engineered private mobile app
+  APIs (MangaPlus and similar). Those are the things that actually get an IP or
+  account banned, and this is a personal offline archive, not a re-publication
+  tool. ComicK's API currently returns 522 and Bato redirects to a closure
+  notice, so neither is a working option today.
+
+A pasted WEBTOON URL is redirected by the site to the edition that owns it, so
+"does this title exist in another edition?" is answered by browsing that
+edition's catalogue rather than by rewriting the locale segment of the URL.
+
+## Rate limits and how many parallel downloads are safe
+
+All HTTP now goes through one shared, per-host budget (`net.py`) instead of each
+queue slot running its own timer. That means raising **Parallel slots** cannot
+push the origin past what it tolerates — extra slots wait on the same bucket.
+
+Measured on this machine, using `python limittest.py --raw` (which deliberately
+bypasses the limiter to find the origin's own ceiling):
+
+| Origin | Observed behaviour |
+| --- | --- |
+| `www.webtoons.com` (HTML pages) | ~2 rps is comfortable; 8–10 rps starts returning 429/5xx; short 48-wide bursts still succeed but are not repeatable |
+| `webtoon-phinf.pstatic.net` (page images) | 24 concurrent ≈ 2.3 MiB/s (best observed); 48–64 concurrent is *slower* (0.7–1.0 MiB/s) due to connection contention |
+| `api.mangadex.org` | documented **5 req/s** global; `/at-home/server` documented **40 req/min**. 60 requests at 10 concurrent returned no 429 |
+| MangaDex `@Home` image hosts | fastest around 2–4 concurrent per chapter; more does not help |
+| `tapas.io` (HTML) | ~1.5 rps comfortable; episode page ≈0.5 s each |
+| `us-a.tapas.io` (page images) | **4 concurrent ≈ 3.4 MiB/s, the best observed**; 8 concurrent dropped to 1.7 MiB/s |
+
+Default budgets shipped in `net.py`: 2 rps / 4 in-flight for webtoons.com, 12 rps
+/ 16 in-flight for the webtoon image CDN, 3 rps for the MangaDex API, 0.6 rps for
+`/at-home/server` (its own stricter quota), 1.5 rps for tapas.io and 8 rps for its
+image host. They are conservative on purpose.
+
+Practical guidance:
+
+- **2–4 queue slots** is the sane range for a mixture of sources. The slider goes
+  to 8, but HTML crawling does not get faster past a few slots, and every image
+  CDN measured (WEBTOON, MangaDex, Tapas) got *slower* past ~4–8 concurrent
+  requests per episode.
+- Real throughput is dominated by **page count**, not slots: a 100-page episode at
+  24 concurrent image fetches takes a few seconds, while the viewer-page request
+  is rate-limited to ~2/s.
+- If you do see 429s, the limiter pauses the **whole host** for the
+  `Retry-After` period, so one blocked request cannot snowball into a ban. Lower
+  the slot count or raise `img_delay` in Settings.
+- `python limittest.py` (without `--raw`) reports what the app will actually do
+  with its current budgets; `--raw` shows the origin's threshold. Exit code is
+  non-zero if any level was rate-limited.
+
+## Download safety
+
+Every page can be checked before it is archived (Settings → **Download safety**):
+
+- **Verify every saved page is a real image** (on by default in new installs):
+  the bytes must match a JPEG/PNG/GIF/WebP/BMP signature and be a plausible size.
+  This catches the most common real failure — an HTML error page saved under a
+  `.jpg` name — which would otherwise be archived as "downloaded" and break the
+  reader permanently. Failed pages mark the episode as failed so the queue's
+  retry logic handles it.
+- **Antivirus scan**: if ClamAV (`clamscan`/`clamdscan`) is installed, each page
+  is scanned before it is kept. If it is not installed the Settings page says so
+  explicitly rather than implying files were scanned.
+
+Files are written to a `.part` file and only renamed into place after they pass,
+so an interrupted or rejected download never leaves a corrupt page behind.
+Nothing downloaded is ever executed or rendered by the checker.
+
+## Download queue
+
+Every long action — whole-series downloads, episode-list refreshes, availability checks,
+exports and watchlist scans — runs through one background queue instead of blocking the
+page.
+
+- **Queue page** (top nav) shows every job with live progress. The **Parallel slots** slider
+  sets how many jobs run at once (1–8). The setting is remembered.
+- **Queue several series at once** from the Library page: tick the checkbox on each card
+  (or **Select all**) and press **⧉ Queue selected**. Each becomes a "Download all
+  episodes" job; a series already waiting or running is skipped rather than queued twice.
+- **⏸ Pause queue** stops new jobs from starting while letting running ones finish;
+  **▶ Resume** continues. **Cancel** works per job (a running download stops between
+  episodes) and **✕ Cancel queued** clears everything that hasn't started.
+- **Auto-retry** re-queues failed download/refresh/check jobs with a growing delay until
+  the **Max attempts** limit; failed episodes in an otherwise-finished download are only
+  re-attempted, so retries are cheap. Use **↻ Retry all failed** or a single job's
+  **Retry** to try again manually.
+- **Clear finished** removes done/failed/cancelled jobs; **Remove** deletes one.
+- Queue preferences (slots, auto-retry, max attempts) are saved in the `settings` table
+  and restored on restart. The job history itself lives in memory, so it resets when the
+  server restarts.
+
 ## Bulk export for self-hosting
 
 Everything already saved in Phoenix Records can be bundled into a single archive,
@@ -106,17 +216,29 @@ cleaned automatically after a day.
 ```
 app.py          Flask server + background download/export jobs
 webtoon.py      webtoons.com list/viewer parsing and image downloader
+sources.py      source layer: WEBTOON editions + MangaDex API
+net.py          shared per-host rate limiter and polite HTTP client
+scanner.py      downloaded-page validation and optional antivirus scanning
+limittest.py    measures real throughput and rate-limit thresholds
 db.py           SQLite schema (series, episodes, progress per profile, settings)
-templates/      Library, series detail, reader, settings pages
-static/         CSS + reader scroll-progress script
+templates/      Library, series detail, queue, reader, settings pages
+static/         CSS + reader scroll-progress and queue scripts
 data/           netscroll.db (auto-created) + secret key
 downloads/      per-series image folders (auto-created)
 exports/        temporary bulk-export ZIPs (auto-created, pruned)
+tests/          offline tests (python tests/test_queue.py, python tests/test_sources.py)
 ```
 
 ## Being polite & staying safe
 
-- Requests are throttled (Settings → delays). Keep the defaults or raise them.
+- Requests are throttled per host, and the limiter backs off the whole host when a
+  server asks it to. Keep the defaults or raise the delays.
 - This is for **personal offline backup** of content you can already read with your own
   account. Don't redistribute downloads, don't run multi-account farming (Naver bans for
   that), and respect the creators by supporting the official releases.
+- MangaDex's API terms ask that you identify yourself (the app sends a descriptive
+  User-Agent), stay under their documented limits, and credit the site and scanlation
+  groups if you display the pages. Downloaded MangaDex pages keep their chapter metadata
+  in `manifest.json` when exported.
+- Prefer the smallest number of slots that finishes your queue. Faster is not better if
+  it gets the IP blocked.
